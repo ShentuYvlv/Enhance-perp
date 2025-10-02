@@ -22,10 +22,27 @@ PARADEX_ENVIRONMENT=prod # or testnet
 ASTER_API_KEY=your_aster_api_key
 ASTER_SECRET_KEY=your_aster_secret_key
 
-# Lighter Configuration
+# Lighter Configuration (for single account trading)
 API_KEY_PRIVATE_KEY=your_api_key_private_key_here
 LIGHTER_ACCOUNT_INDEX=0
 LIGHTER_API_KEY_INDEX=0
+
+# Lighter Dual Account Configuration (for Hedge Volume Bot)
+# Account 1 - Opens LONG positions
+API_KEY_PRIVATE_KEY_1=your_account1_private_key_here
+LIGHTER_ACCOUNT_INDEX_1=0
+LIGHTER_API_KEY_INDEX_1=0
+
+# Account 2 - Opens SHORT positions
+API_KEY_PRIVATE_KEY_2=your_account2_private_key_here
+LIGHTER_ACCOUNT_INDEX_2=1
+LIGHTER_API_KEY_INDEX_2=0
+
+# Hedge Volume Bot Configuration
+HEDGE_MARGIN=100                    # Margin per trade in USDC
+HEDGE_POSITION_HOLD_TIME=300        # Position hold time in seconds (default: 300s = 5 minutes)
+HEDGE_TAKE_PROFIT=50                # Take profit percentage (default: 50%)
+HEDGE_STOP_LOSS=50                  # Stop loss percentage (default: 50%)
 
 # Notification (optional)
 # guide: https://www.feishu.cn/hc/zh-CN/articles/185289387886-%E6%B6%88%E6%81%AF%E5%8A%A9%E6%89%8B-%E6%9C%BA%E5%99%A8%E4%BA%BA
