@@ -576,11 +576,16 @@ class LighterClient(BaseExchangeClient):
         try:
             # Use official SDK to get account balance
             account_api = lighter.AccountApi(self.api_client)
-            account_info = await account_api.account(self.account_index)
 
-            if not account_info:
+            # Call with correct parameters: by="index", value=str(account_index)
+            account_data = await account_api.account(by="index", value=str(self.account_index))
+
+            if not account_data or not account_data.accounts:
                 self.logger.log("Failed to get account info", "ERROR")
                 raise ValueError("Failed to get account info")
+
+            # Get first account from the list
+            account_info = account_data.accounts[0]
 
             # Get available balance (in USDC, adjusted for decimals)
             # Lighter uses 6 decimals for USDC
