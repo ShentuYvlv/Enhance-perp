@@ -491,6 +491,88 @@ class ParadexClient(BaseExchangeClient):
             status=order_status
         )
 
+    async def place_market_order(self, contract_id: str, quantity: Decimal, side: str,
+                                  aggressive_offset: Decimal = Decimal('0.003')) -> OrderResult:
+        """Place a market order using aggressive limit order pricing.
+
+        Args:
+            contract_id: Market ID
+            quantity: Order quantity
+            side: 'buy' or 'sell'
+            aggressive_offset: Price offset percentage to ensure immediate fill (default 0.3%)
+
+        Returns:
+            OrderResult with order details
+        """
+        from paradex_py.common.order import OrderSide
+
+        # Get current market prices
+        best_bid, best_ask = await self.fetch_bbo_prices(contract_id)
+
+        if best_bid <= 0 or best_ask <= 0 or best_bid >= best_ask:
+            raise ValueError("Invalid bid/ask prices")
+
+        # Calculate aggressive price for immediate fill
+        if side.lower() == 'buy':
+            # Buy: pay above best ask to ensure fill
+            aggressive_price = best_ask * (Decimal('1') + aggressive_offset)
+            order_side = OrderSide.Buy
+        elif side.lower() == 'sell':
+            # Sell: sell below best bid to ensure fill
+            aggressive_price = best_bid * (Decimal('1') - aggressive_offset)
+            order_side = OrderSide.Sell
+        else:
+            raise ValueError(f"Invalid side: {side}")
+
+        aggressive_price = self.round_to_tick(aggressive_price)
+
+        self.logger.log(f"[MARKET] Placing {side} market order: {quantity} @ {aggressive_price} "
+                       f"(bid={best_bid}, ask={best_ask})", "INFO")
+
+        # Place limit order with aggressive price
+        order_result = await self.place_post_only_order(contract_id, quantity, aggressive_price, order_side)
+
+        # Wait for order to fill or timeout
+        import time
+        start_time = time.time()
+        timeout = 10
+
+        while time.time() - start_time < timeout:
+            order_info = await self.get_order_info(order_result.order_id)
+
+            if order_info is None:
+                await asyncio.sleep(0.5)
+                continue
+
+            if order_info.status == 'CLOSED' and order_info.filled_size > 0:
+                # Order filled
+                return OrderResult(
+                    success=True,
+                    order_id=order_result.order_id,
+                    side=side,
+                    size=quantity,
+                    price=order_info.price,
+                    status='FILLED',
+                    filled_size=order_info.filled_size
+                )
+            elif order_info.status == 'OPEN':
+                # Still open, wait a bit
+                await asyncio.sleep(0.2)
+            else:
+                # Unexpected status
+                self.logger.log(f"[MARKET] Unexpected status: {order_info.status}", "WARNING")
+                break
+
+        # Timeout or unexpected status - cancel order
+        self.logger.log(f"[MARKET] Order not filled within {timeout}s, cancelling", "WARNING")
+        await self.cancel_order(order_result.order_id)
+
+        return OrderResult(
+            success=False,
+            error_message=f"Market order not filled within {timeout}s",
+            order_id=order_result.order_id
+        )
+
     async def cancel_order(self, order_id: str) -> OrderResult:
         """Cancel an order with Paradex using official SDK."""
         try:
@@ -588,6 +670,30 @@ class ParadexClient(BaseExchangeClient):
                 return abs(Decimal(position.get('size', 0)).quantize(self.order_size_increment, rounding=ROUND_HALF_UP))
 
         return Decimal(0)
+
+    async def get_account_balance(self) -> Decimal:
+        """Get available USDC balance for trading.
+
+        Returns:
+            Available USDC balance as Decimal
+        """
+        try:
+            # Fetch account summary which includes balance info
+            account_summary = self.paradex.api_client.fetch_account()
+
+            if not account_summary:
+                self.logger.log("Failed to get account summary", "ERROR")
+                raise ValueError("Failed to get account summary")
+
+            # Get equity (total account value in USDC)
+            equity = Decimal(account_summary.get('equity', 0))
+
+            self.logger.log(f"Account balance: {equity} USDC", "INFO")
+            return equity
+
+        except Exception as e:
+            self.logger.log(f"Error getting account balance: {e}", "ERROR")
+            raise
 
     @retry(
         stop=stop_after_attempt(5),

@@ -567,6 +567,32 @@ class LighterClient(BaseExchangeClient):
 
         return Decimal(0)
 
+    async def get_account_balance(self) -> Decimal:
+        """Get available USDC balance for trading.
+
+        Returns:
+            Available USDC balance as Decimal
+        """
+        try:
+            # Use official SDK to get account balance
+            account_api = lighter.AccountApi(self.api_client)
+            account_info = await account_api.account(self.account_index)
+
+            if not account_info:
+                self.logger.log("Failed to get account info", "ERROR")
+                raise ValueError("Failed to get account info")
+
+            # Get available balance (in USDC, adjusted for decimals)
+            # Lighter uses 6 decimals for USDC
+            available_balance = Decimal(account_info.available_balance) / Decimal('1e6')
+
+            self.logger.log(f"Account balance: {available_balance} USDC", "INFO")
+            return available_balance
+
+        except Exception as e:
+            self.logger.log(f"Error getting account balance: {e}", "ERROR")
+            raise
+
     async def get_contract_attributes(self) -> Tuple[str, Decimal]:
         """Get contract ID for a ticker."""
         ticker = self.config.ticker
