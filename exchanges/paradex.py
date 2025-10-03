@@ -106,6 +106,7 @@ class ParadexClient(BaseExchangeClient):
 
         self._order_update_handler = None
         self.order_size_increment = ''
+        self.min_notional = Decimal(0)  # Will be set during get_contract_attributes()
 
     def _initialize_paradex_client(self) -> None:
         """Initialize the Paradex client with L2 credentials only."""
@@ -383,6 +384,15 @@ class ParadexClient(BaseExchangeClient):
                 raise Exception(f"[OPEN] Invalid direction: {direction}")
 
             order_price = await self.get_order_price(direction)
+
+            # Validate order notional against min_notional (only on first attempt)
+            if attempt == 1:
+                order_notional = quantity * order_price
+                if self.min_notional > 0 and order_notional < self.min_notional:
+                    error_msg = f"Order notional {order_notional} < min_notional {self.min_notional}"
+                    self.logger.log(f"[OPEN] {error_msg}", "ERROR")
+                    raise ValueError(error_msg)
+
             order_result = await self.place_post_only_order(contract_id, quantity, order_price, order_side)
             order_status = order_result.status
             order_id = order_result.order_id
@@ -468,6 +478,15 @@ class ParadexClient(BaseExchangeClient):
                     adjusted_price = price
 
             adjusted_price = self.round_to_tick(adjusted_price)
+
+            # Validate order notional against min_notional (only on first attempt)
+            if attempt == 1:
+                order_notional = quantity * adjusted_price
+                if self.min_notional > 0 and order_notional < self.min_notional:
+                    error_msg = f"Order notional {order_notional} < min_notional {self.min_notional}"
+                    self.logger.log(f"[CLOSE] {error_msg}", "ERROR")
+                    raise ValueError(error_msg)
+
             order_result = await self.place_post_only_order(contract_id, quantity, adjusted_price, order_side)
             order_status = order_result.status
             order_id = order_result.order_id
@@ -491,6 +510,98 @@ class ParadexClient(BaseExchangeClient):
             size=quantity,
             price=adjusted_price,
             status=order_status
+        )
+
+    async def place_market_order(self, contract_id: str, quantity: Decimal, side: str,
+                                  aggressive_offset: Decimal = Decimal('0.003')) -> OrderResult:
+        """Place a market order using aggressive limit order pricing.
+
+        Args:
+            contract_id: Market ID
+            quantity: Order quantity
+            side: 'buy' or 'sell'
+            aggressive_offset: Price offset percentage to ensure immediate fill (default 0.3%)
+
+        Returns:
+            OrderResult with order details
+        """
+        from paradex_py.common.order import OrderSide
+
+        # Get current market prices
+        best_bid, best_ask = await self.fetch_bbo_prices(contract_id)
+
+        if best_bid <= 0 or best_ask <= 0 or best_bid >= best_ask:
+            raise ValueError("Invalid bid/ask prices")
+
+        # Calculate aggressive price for immediate fill
+        if side.lower() == 'buy':
+            # Buy: pay above best ask to ensure fill
+            aggressive_price = best_ask * (Decimal('1') + aggressive_offset)
+            order_side = OrderSide.Buy
+        elif side.lower() == 'sell':
+            # Sell: sell below best bid to ensure fill
+            aggressive_price = best_bid * (Decimal('1') - aggressive_offset)
+            order_side = OrderSide.Sell
+        else:
+            raise ValueError(f"Invalid side: {side}")
+
+        aggressive_price = self.round_to_tick(aggressive_price)
+
+        # Validate order notional against min_notional
+        order_notional = quantity * aggressive_price
+        if self.min_notional > 0 and order_notional < self.min_notional:
+            error_msg = f"Order notional {order_notional} < min_notional {self.min_notional}"
+            self.logger.log(f"[MARKET] {error_msg}", "ERROR")
+            return OrderResult(
+                success=False,
+                error_message=error_msg
+            )
+
+        self.logger.log(f"[MARKET] Placing {side} market order: {quantity} @ {aggressive_price} "
+                       f"(bid={best_bid}, ask={best_ask}, notional={order_notional})", "INFO")
+
+        # Place limit order with aggressive price
+        order_result = await self.place_post_only_order(contract_id, quantity, aggressive_price, order_side)
+
+        # Wait for order to fill or timeout
+        import time
+        start_time = time.time()
+        timeout = 10
+
+        while time.time() - start_time < timeout:
+            order_info = await self.get_order_info(order_result.order_id)
+
+            if order_info is None:
+                await asyncio.sleep(0.5)
+                continue
+
+            if order_info.status == 'CLOSED' and order_info.filled_size > 0:
+                # Order filled
+                return OrderResult(
+                    success=True,
+                    order_id=order_result.order_id,
+                    side=side,
+                    size=quantity,
+                    price=order_info.price,
+                    status='FILLED',
+                    filled_size=order_info.filled_size
+                )
+            elif order_info.status == 'OPEN':
+                # Still open, wait a bit
+                await asyncio.sleep(0.2)
+            else:
+                # Unexpected status
+                self.logger.log(f"[MARKET] Unexpected status: {order_info.status}", "WARNING")
+                break
+
+        # Timeout or unexpected status - cancel order
+        self.logger.log(f"[MARKET] Order not filled within {timeout}s, cancelling", "WARNING")
+        await self.cancel_order(order_result.order_id)
+
+        return OrderResult(
+            success=False,
+            error_message=f"Market order not filled within {timeout}s",
+            order_id=order_result.order_id
         )
 
     async def cancel_order(self, order_id: str) -> OrderResult:
@@ -591,6 +702,41 @@ class ParadexClient(BaseExchangeClient):
 
         return Decimal(0)
 
+    async def get_account_balance(self) -> Decimal:
+        """Get available USDC balance for trading.
+
+        Returns:
+            Available USDC balance as Decimal
+        """
+        try:
+            # Fetch account summary which includes balance info
+            account_summary = self.paradex.api_client.fetch_account_summary()
+
+            if not account_summary:
+                self.logger.log("Failed to get account summary", "ERROR")
+                raise ValueError("Failed to get account summary")
+
+            # AccountSummary is an object, access attributes directly
+            # Try multiple possible attribute names
+            if hasattr(account_summary, 'equity'):
+                equity = Decimal(str(account_summary.equity))
+            elif hasattr(account_summary, 'total_equity'):
+                equity = Decimal(str(account_summary.total_equity))
+            elif hasattr(account_summary, 'account_value'):
+                equity = Decimal(str(account_summary.account_value))
+            else:
+                # Log available attributes for debugging
+                attrs = [attr for attr in dir(account_summary) if not attr.startswith('_')]
+                self.logger.log(f"Available AccountSummary attributes: {attrs}", "INFO")
+                raise ValueError("Could not find equity field in AccountSummary")
+
+            self.logger.log(f"Account balance (equity): {equity} USDC", "INFO")
+            return equity
+
+        except Exception as e:
+            self.logger.log(f"Error getting account balance: {e}", "ERROR")
+            raise
+
     @retry(
         stop=stop_after_attempt(5),
         wait=wait_fixed(3),
@@ -655,10 +801,8 @@ class ParadexClient(BaseExchangeClient):
             self.logger.log("Failed to get min quantity", "ERROR")
             raise ValueError("Failed to get min quantity")
 
-        order_notional = last_price * self.config.quantity
-        if order_notional < min_notional:
-            self.logger.log(f"Order notional is less than min notional: {order_notional} < {min_notional}", "ERROR")
-            raise ValueError(f"Order notional is less than min notional: {order_notional} < {min_notional}")
+        # Store min_notional for validation during order placement
+        self.min_notional = min_notional
 
         try:
             self.config.tick_size = Decimal(market.get('price_tick_size'))

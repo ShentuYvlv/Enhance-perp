@@ -361,6 +361,71 @@ class LighterClient(BaseExchangeClient):
             )
         else:
             raise Exception(f"[CLOSE] Error placing order: {order_result.error_message}")
+
+    async def place_market_order(self, contract_id: str, quantity: Decimal, side: str,
+                                  aggressive_offset: Decimal = Decimal('0.002')) -> OrderResult:
+        """Place a market order using aggressive limit order pricing.
+
+        Args:
+            contract_id: Market ID
+            quantity: Order quantity
+            side: 'buy' or 'sell'
+            aggressive_offset: Price offset percentage to ensure immediate fill (default 0.2%)
+
+        Returns:
+            OrderResult with order details
+        """
+        # Get current market prices
+        best_bid, best_ask = await self.fetch_bbo_prices(contract_id)
+
+        if best_bid <= 0 or best_ask <= 0 or best_bid >= best_ask:
+            raise ValueError("Invalid bid/ask prices")
+
+        # Calculate aggressive price for immediate fill
+        if side.lower() == 'buy':
+            # Buy at ask price + offset (aggressive buy)
+            price = best_ask * (1 + aggressive_offset)
+        else:
+            # Sell at bid price - offset (aggressive sell)
+            price = best_bid * (1 - aggressive_offset)
+
+        price = self.round_to_tick(price)
+
+        self.logger.log(f"[MARKET] Placing market {side} order at aggressive price {price} "
+                       f"(bid={best_bid}, ask={best_ask})", "INFO")
+
+        # Reset current order tracking
+        self.current_order = None
+        self.current_order_client_id = None
+
+        # Place limit order at aggressive price
+        order_result = await self.place_limit_order(contract_id, quantity, price, side)
+
+        if not order_result.success:
+            raise Exception(f"[MARKET] Error placing order: {order_result.error_message}")
+
+        # Wait for fill with shorter timeout (market orders should fill quickly)
+        start_time = time.time()
+        order_status = 'OPEN'
+
+        while time.time() - start_time < 5 and order_status != 'FILLED':
+            await asyncio.sleep(0.1)
+            if self.current_order is not None:
+                order_status = self.current_order.status
+
+        # If not filled after 5 seconds, something is wrong
+        if order_status != 'FILLED':
+            self.logger.log(f"[MARKET] Warning: Order not filled after 5 seconds, status={order_status}", "WARNING")
+
+        return OrderResult(
+            success=True,
+            order_id=self.current_order.order_id if self.current_order else order_result.order_id,
+            side=side,
+            size=quantity,
+            price=price,
+            status=order_status,
+            filled_size=self.current_order.filled_size if self.current_order else Decimal(0)
+        )
     
     async def get_order_price(self, side: str = '') -> Decimal:
         """Get the price of an order with Lighter using official SDK."""
@@ -504,6 +569,37 @@ class LighterClient(BaseExchangeClient):
                 return Decimal(position.position)
 
         return Decimal(0)
+
+    async def get_account_balance(self) -> Decimal:
+        """Get available USDC balance for trading.
+
+        Returns:
+            Available USDC balance as Decimal
+        """
+        try:
+            # Use official SDK to get account balance
+            account_api = lighter.AccountApi(self.api_client)
+
+            # Call with correct parameters: by="index", value=str(account_index)
+            account_data = await account_api.account(by="index", value=str(self.account_index))
+
+            if not account_data or not account_data.accounts:
+                self.logger.log("Failed to get account info", "ERROR")
+                raise ValueError("Failed to get account info")
+
+            # Get first account from the list
+            account_info = account_data.accounts[0]
+
+            # Get available balance (in USDC, adjusted for decimals)
+            # Lighter uses 6 decimals for USDC
+            available_balance = Decimal(account_info.available_balance) / Decimal('1e6')
+
+            self.logger.log(f"Account balance: {available_balance} USDC", "INFO")
+            return available_balance
+
+        except Exception as e:
+            self.logger.log(f"Error getting account balance: {e}", "ERROR")
+            raise
 
     async def get_contract_attributes(self) -> Tuple[str, Decimal]:
         """Get contract ID for a ticker."""
