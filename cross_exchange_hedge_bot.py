@@ -25,6 +25,7 @@ class CrossHedgeConfig:
     take_profit: Decimal  # Take profit percentage (default 50%)
     stop_loss: Decimal  # Stop loss percentage (default 50%)
     reverse: bool = False  # Reverse direction (Paradex SHORT + Lighter LONG)
+    cycle_wait: int = 20  # Wait time between trading cycles in seconds
     contract_id: str = ''
     tick_size: Decimal = Decimal(0)
 
@@ -533,8 +534,8 @@ class CrossExchangeHedgeBot:
                     success = await self._open_hedge_positions()
 
                     if not success:
-                        self.logger.log("Failed to open positions, retrying in 20 seconds...", "WARNING")
-                        await asyncio.sleep(20)
+                        self.logger.log(f"Failed to open positions, retrying in {self.config.cycle_wait} seconds...", "WARNING")
+                        await asyncio.sleep(self.config.cycle_wait)
                         continue
 
                     # Monitor position until hold time expires or stop conditions met
@@ -560,14 +561,14 @@ class CrossExchangeHedgeBot:
                     # Close positions
                     await self._close_hedge_positions()
 
-                    # Wait 20 seconds before next cycle
-                    self.logger.log("Waiting 20 seconds before next cycle...", "INFO")
-                    await asyncio.sleep(20)
+                    # Wait before next cycle
+                    self.logger.log(f"Waiting {self.config.cycle_wait} seconds before next cycle...", "INFO")
+                    await asyncio.sleep(self.config.cycle_wait)
 
                 except Exception as e:
                     self.logger.log(f"Error in trading cycle: {e}", "ERROR")
                     self.logger.log(f"Traceback: {traceback.format_exc()}", "ERROR")
-                    await asyncio.sleep(20)
+                    await asyncio.sleep(self.config.cycle_wait)
 
         except KeyboardInterrupt:
             self.logger.log("Bot stopped by user", "INFO")

@@ -111,6 +111,7 @@ async def main():
     take_profit = args.take_profit if args.take_profit else Decimal(os.getenv('CROSS_HEDGE_TAKE_PROFIT', '50'))
     stop_loss = args.stop_loss if args.stop_loss else Decimal(os.getenv('CROSS_HEDGE_STOP_LOSS', '50'))
     reverse = os.getenv('CROSS_HEDGE_REVERSE', 'false').lower() == 'true'
+    cycle_wait = int(os.getenv('CROSS_HEDGE_CYCLE_WAIT', '20'))
 
     # Create configuration
     config = CrossHedgeConfig(
@@ -119,7 +120,8 @@ async def main():
         hold_time=hold_time,
         take_profit=take_profit,
         stop_loss=stop_loss,
-        reverse=reverse
+        reverse=reverse,
+        cycle_wait=cycle_wait
     )
 
     # Create and run the bot
