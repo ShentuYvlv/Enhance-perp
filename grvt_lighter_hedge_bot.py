@@ -1,5 +1,5 @@
 """
-Cross-Exchange Hedge Bot - Paradex ↔ Lighter Hedging for Volume Generation
+Cross-Exchange Hedge Bot - GRVT ↔ Lighter Hedging for Volume Generation
 """
 
 import os
@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Optional, Tuple
 
-from exchanges.paradex import ParadexClient
+from exchanges.grvt import GrvtClient
 from exchanges.lighter import LighterClient
 from helpers import TradingLogger
 from helpers.lark_bot import LarkBot
@@ -24,7 +24,7 @@ class CrossHedgeConfig:
     hold_time: int  # Position hold time in seconds
     take_profit: Decimal  # Take profit percentage (default 50%)
     stop_loss: Decimal  # Stop loss percentage (default 50%)
-    reverse: bool = False  # Reverse direction (Paradex SHORT + Lighter LONG)
+    reverse: bool = False  # Reverse direction (GRVT SHORT + Lighter LONG)
     cycle_wait: int = 20  # Wait time between trading cycles in seconds
     contract_id: str = ''
     tick_size: Decimal = Decimal(0)
@@ -33,29 +33,29 @@ class CrossHedgeConfig:
 @dataclass
 class CrossPositionState:
     """Track position state for both exchanges."""
-    paradex_order_id: Optional[str] = None
+    grvt_order_id: Optional[str] = None
     lighter_order_id: Optional[str] = None
-    paradex_entry_price: Optional[Decimal] = None
+    grvt_entry_price: Optional[Decimal] = None
     lighter_entry_price: Optional[Decimal] = None
-    paradex_quantity: Optional[Decimal] = None
+    grvt_quantity: Optional[Decimal] = None
     lighter_quantity: Optional[Decimal] = None
     entry_time: Optional[float] = None
     is_open: bool = False
 
 
-class CrossExchangeHedgeBot:
-    """Cross-exchange hedge trading bot for volume generation (Paradex ↔ Lighter)."""
+class GrvtLighterHedgeBot:
+    """Cross-exchange hedge trading bot for volume generation (GRVT ↔ Lighter)."""
 
     def __init__(self, config: CrossHedgeConfig):
         self.config = config
-        self.logger = TradingLogger("cross_hedge", config.ticker, log_to_console=True)
+        self.logger = TradingLogger("grvt_lighter_hedge", config.ticker, log_to_console=True)
 
         # Position tracking
         self.position = CrossPositionState()
         self.shutdown_requested = False
 
-        # Create separate clients for Paradex and Lighter
-        self.paradex_client = None
+        # Create separate clients for GRVT and Lighter
+        self.grvt_client = None
         self.lighter_client = None
 
     def _create_client_config(self, ticker: str, exchange: str) -> object:
@@ -77,37 +77,28 @@ class CrossExchangeHedgeBot:
         return MinimalConfig(ticker, exchange)
 
     async def initialize(self):
-        """Initialize both Paradex and Lighter clients."""
+        """Initialize both GRVT and Lighter clients."""
         try:
-            self.logger.log("Initializing Paradex and Lighter clients...", "INFO")
+            self.logger.log("Initializing GRVT and Lighter clients...", "INFO")
 
-            # Initialize Paradex Client
-            self.logger.log("Connecting to Paradex...", "INFO")
-            paradex_config = self._create_client_config(self.config.ticker, 'paradex')
-            self.paradex_client = ParadexClient(paradex_config)
-            await self.paradex_client.connect()
+            # Initialize GRVT Client
+            self.logger.log("Connecting to GRVT...", "INFO")
+            grvt_config = self._create_client_config(self.config.ticker, 'grvt')
+            self.grvt_client = GrvtClient(grvt_config)
+            await self.grvt_client.connect()
 
-            # Get Paradex contract attributes
-            paradex_contract_id, paradex_tick_size = await self.paradex_client.get_contract_attributes()
-            self.logger.log(f"Paradex: {self.config.ticker} = {paradex_contract_id}", "INFO")
+            # Get GRVT contract attributes
+            grvt_contract_id, grvt_tick_size = await self.grvt_client.get_contract_attributes()
+            self.logger.log(f"GRVT: {self.config.ticker} = {grvt_contract_id}", "INFO")
 
             # Initialize Lighter Client
             self.logger.log("Connecting to Lighter...", "INFO")
-
-            # Debug: Print Lighter credentials
-            import os
-            lighter_account_index = os.getenv('LIGHTER_ACCOUNT_INDEX', 'NOT SET')
-            lighter_api_key_index = os.getenv('LIGHTER_API_KEY_INDEX', 'NOT SET')
-            api_key_exists = 'YES' if os.getenv('API_KEY_PRIVATE_KEY') else 'NO'
-            self.logger.log(f"[DEBUG] Lighter Config: ACCOUNT_INDEX={lighter_account_index}, "
-                          f"API_KEY_INDEX={lighter_api_key_index}, API_KEY_EXISTS={api_key_exists}", "INFO")
 
             # Create Lighter config
             lighter_config = self._create_client_config(self.config.ticker, 'lighter')
             self.lighter_client = LighterClient(lighter_config)
 
             # CRITICAL: Get contract_id BEFORE connecting to ensure WebSocket subscribes to correct channel
-            # This must be done before connect() because WebSocket uses contract_id for subscription
             lighter_contract_id, lighter_tick_size = await self.lighter_client.get_contract_attributes()
             self.logger.log(f"Lighter: {self.config.ticker} = Market ID {lighter_contract_id}", "INFO")
 
@@ -118,9 +109,9 @@ class CrossExchangeHedgeBot:
             # Now connect with correct contract_id set
             await self.lighter_client.connect()
 
-            # Store contract info (use Paradex's for general config)
-            self.config.contract_id = paradex_contract_id
-            self.config.tick_size = paradex_tick_size
+            # Store contract info (use GRVT's for general config)
+            self.config.contract_id = grvt_contract_id
+            self.config.tick_size = grvt_tick_size
 
             # Wait for WebSocket connections to be fully established
             self.logger.log("Waiting for WebSocket connections to establish...", "INFO")
@@ -129,7 +120,7 @@ class CrossExchangeHedgeBot:
             # Verify WebSocket connections are ready
             max_retries = 10
             for i in range(max_retries):
-                paradex_ready = True  # Paradex usually ready immediately
+                grvt_ready = True  # GRVT usually ready immediately
                 lighter_ready = (hasattr(self.lighter_client, 'ws_manager') and
                                 self.lighter_client.ws_manager and
                                 self.lighter_client.ws_manager.best_bid)
@@ -144,10 +135,6 @@ class CrossExchangeHedgeBot:
             if not lighter_ready:
                 self.logger.log("Warning: Lighter WebSocket may not be fully ready", "WARNING")
 
-            # Note: Balance check removed - leverage is set at exchange account level
-            # Exchange APIs will return error if insufficient margin for the position
-            # This allows users with high leverage (e.g., 35x) to trade with smaller balances
-
             self.logger.log("Both exchanges initialized successfully", "INFO")
 
         except Exception as e:
@@ -155,100 +142,18 @@ class CrossExchangeHedgeBot:
             self.logger.log(f"Traceback: {traceback.format_exc()}", "ERROR")
             raise
 
-    async def _check_account_balances(self):
-        """Check account balances on both exchanges and terminate if insufficient."""
-        try:
-            # Get balances
-            paradex_balance = await self.paradex_client.get_account_balance()
-
-            # ========== Lighter Balance Debugging ==========
-            import lighter
-            account_api = lighter.AccountApi(self.lighter_client.api_client)
-            account_data = await account_api.account(
-                by="index",
-                value=str(self.lighter_client.account_index)
-            )
-
-            self.logger.log(f"[DEBUG] Lighter API Response:", "INFO")
-            self.logger.log(f"  - account_data type: {type(account_data)}", "INFO")
-            self.logger.log(f"  - account_data.total: {account_data.total}", "INFO")
-            self.logger.log(f"  - account_data.accounts length: {len(account_data.accounts)}", "INFO")
-
-            if account_data.accounts:
-                acc = account_data.accounts[0]
-                self.logger.log(f"  - available_balance: {acc.available_balance}", "INFO")
-                self.logger.log(f"  - collateral: {acc.collateral}", "INFO")
-                self.logger.log(f"  - total_asset_value: {acc.total_asset_value}", "INFO")
-                self.logger.log(f"  - cross_asset_value: {acc.cross_asset_value}", "INFO")
-
-                # Test different interpretations
-                if acc.available_balance is not None:
-                    try:
-                        avail_as_decimal = Decimal(acc.available_balance)
-                        avail_divided = avail_as_decimal / Decimal('1e6')
-                        self.logger.log(f"  - available_balance as Decimal: {avail_as_decimal}", "INFO")
-                        self.logger.log(f"  - available_balance / 1e6: {avail_divided}", "INFO")
-                    except Exception as e:
-                        self.logger.log(f"  - Error parsing available_balance: {e}", "ERROR")
-
-                try:
-                    collateral_as_decimal = Decimal(acc.collateral)
-                    collateral_divided = collateral_as_decimal / Decimal('1e6')
-                    self.logger.log(f"  - collateral as Decimal: {collateral_as_decimal}", "INFO")
-                    self.logger.log(f"  - collateral / 1e6: {collateral_divided}", "INFO")
-                except Exception as e:
-                    self.logger.log(f"  - Error parsing collateral: {e}", "ERROR")
-
-                try:
-                    total_asset_as_decimal = Decimal(acc.total_asset_value)
-                    total_asset_divided = total_asset_as_decimal / Decimal('1e6')
-                    self.logger.log(f"  - total_asset_value as Decimal: {total_asset_as_decimal}", "INFO")
-                    self.logger.log(f"  - total_asset_value / 1e6: {total_asset_divided}", "INFO")
-                except Exception as e:
-                    self.logger.log(f"  - Error parsing total_asset_value: {e}", "ERROR")
-            # ========== End Debugging ==========
-
-            lighter_balance = await self.lighter_client.get_account_balance()
-
-            # Calculate required balance with more reasonable safety margin
-            # 1.2x accounts for: initial margin + maintenance margin buffer + fees + slippage
-            # Original 2x was overly conservative and blocked valid trades
-            required_balance = self.config.margin * Decimal('1.2')
-
-            self.logger.log(f"Paradex balance: {paradex_balance} USDC (required: {required_balance})", "INFO")
-            self.logger.log(f"Lighter balance: {lighter_balance} USDC (required: {required_balance})", "INFO")
-
-            # Check if either exchange has insufficient balance
-            if paradex_balance < required_balance:
-                error_msg = (f"Insufficient Paradex balance: {paradex_balance} USDC "
-                            f"(required: {required_balance} USDC)")
-                self.logger.log(error_msg, "ERROR")
-                await self.send_notification(f"⚠️ {error_msg}")
-                raise ValueError(error_msg)
-
-            if lighter_balance < required_balance:
-                error_msg = (f"Insufficient Lighter balance: {lighter_balance} USDC "
-                            f"(required: {required_balance} USDC)")
-                self.logger.log(error_msg, "ERROR")
-                await self.send_notification(f"⚠️ {error_msg}")
-                raise ValueError(error_msg)
-
-        except Exception as e:
-            self.logger.log(f"Error checking account balances: {e}", "ERROR")
-            raise
-
     async def _calculate_quantity_from_margin(self, target_price: Decimal, order_side: str) -> Decimal:
-        """Calculate position quantity based on margin and Paradex's actual order price.
+        """Calculate position quantity based on margin and GRVT's actual order price.
 
-        This method ensures that the actual notional value on Paradex matches the target margin,
+        This method ensures that the actual notional value on GRVT matches the target margin,
         accounting for order_size_increment precision truncation.
 
         Args:
-            target_price: Paradex's actual order price (not average)
+            target_price: GRVT's actual order price (not average)
             order_side: 'buy' or 'sell' to handle precision rounding correctly
 
         Returns:
-            Position quantity (adjusted for Paradex's order_size_increment precision)
+            Position quantity (adjusted for GRVT's order_size_increment precision)
         """
         # Ensure target_price is Decimal
         target_price = Decimal(str(target_price))
@@ -256,13 +161,12 @@ class CrossExchangeHedgeBot:
         # Calculate raw quantity based on target margin
         raw_quantity = self.config.margin / target_price
 
-        # Get Paradex's order size increment (precision requirement)
-        paradex_increment = self.paradex_client.order_size_increment
+        # Get GRVT's order size increment (precision requirement)
+        grvt_increment = self.grvt_client.order_size_increment
 
         # CRITICAL: Use ROUND_DOWN to ensure we don't exceed the margin budget
-        # This prevents over-allocation and maintains accurate notional value
         from decimal import ROUND_DOWN
-        adjusted_quantity = raw_quantity.quantize(paradex_increment, rounding=ROUND_DOWN)
+        adjusted_quantity = raw_quantity.quantize(grvt_increment, rounding=ROUND_DOWN)
 
         # Calculate actual notional value after precision truncation
         actual_notional = adjusted_quantity * target_price
@@ -271,7 +175,7 @@ class CrossExchangeHedgeBot:
         self.logger.log(
             f"Quantity calculation: margin={self.config.margin} USDC, price={target_price}, "
             f"raw_qty={raw_quantity:.8f}, adjusted_qty={adjusted_quantity}, "
-            f"actual_notional={actual_notional:.2f} USDC, increment={paradex_increment}",
+            f"actual_notional={actual_notional:.2f} USDC, increment={grvt_increment}",
             "INFO"
         )
 
@@ -289,32 +193,32 @@ class CrossExchangeHedgeBot:
         """Get average price across both exchanges (for monitoring/logging only).
 
         NOTE: This method is NOT used for quantity calculation anymore.
-        Quantity is calculated using Paradex's actual order price to ensure accurate notional value.
+        Quantity is calculated using GRVT's actual order price to ensure accurate notional value.
 
         Returns:
             Average mid price (for reference only)
         """
-        # Get Paradex prices
-        paradex_bid, paradex_ask = await self.paradex_client.fetch_bbo_prices(self.config.contract_id)
-        paradex_mid = (Decimal(str(paradex_bid)) + Decimal(str(paradex_ask))) / Decimal('2')
+        # Get GRVT prices
+        grvt_bid, grvt_ask = await self.grvt_client.fetch_bbo_prices(self.config.contract_id)
+        grvt_mid = (Decimal(str(grvt_bid)) + Decimal(str(grvt_ask))) / Decimal('2')
 
         # Get Lighter prices
         lighter_bid, lighter_ask = await self.lighter_client.fetch_bbo_prices(self.lighter_client.config.contract_id)
         lighter_mid = (Decimal(str(lighter_bid)) + Decimal(str(lighter_ask))) / Decimal('2')
 
         # Calculate average
-        avg_mid = (paradex_mid + lighter_mid) / Decimal('2')
+        avg_mid = (grvt_mid + lighter_mid) / Decimal('2')
 
-        self.logger.log(f"Prices: Paradex={paradex_mid}, Lighter={lighter_mid}, Avg={avg_mid}", "INFO")
+        self.logger.log(f"Prices: GRVT={grvt_mid}, Lighter={lighter_mid}, Avg={avg_mid}", "INFO")
 
         return avg_mid
 
     async def _open_hedge_positions(self) -> bool:
-        """Open hedged positions - Paradex uses maker limit order, Lighter uses market order.
+        """Open hedged positions - GRVT uses maker limit order, Lighter uses market order.
 
         Strategy:
-        1. Place POST_ONLY limit order on Paradex (maker, low fees)
-        2. Wait for Paradex order to fill
+        1. Place POST_ONLY limit order on GRVT (maker, low fees)
+        2. Wait for GRVT order to fill
         3. Once filled, immediately hedge with Lighter market order (taker)
 
         Returns:
@@ -325,85 +229,86 @@ class CrossExchangeHedgeBot:
 
             # Determine sides based on reverse flag
             if self.config.reverse:
-                paradex_side = 'sell'  # Paradex SHORT
+                grvt_side = 'sell'  # GRVT SHORT
                 lighter_side = 'buy'   # Lighter LONG
-                mode_desc = "Reverse mode: Paradex SHORT (maker) + Lighter LONG (taker)"
+                mode_desc = "Reverse mode: GRVT SHORT (maker) + Lighter LONG (taker)"
             else:
-                paradex_side = 'buy'   # Paradex LONG
+                grvt_side = 'buy'   # GRVT LONG
                 lighter_side = 'sell'  # Lighter SHORT
-                mode_desc = "Normal mode: Paradex LONG (maker) + Lighter SHORT (taker)"
+                mode_desc = "Normal mode: GRVT LONG (maker) + Lighter SHORT (taker)"
 
             self.logger.log(mode_desc, "INFO")
 
-            # ========== FIX: Use Paradex's actual order price for quantity calculation ==========
-            # Get Paradex's BBO prices
-            paradex_bid, paradex_ask = await self.paradex_client.fetch_bbo_prices(self.config.contract_id)
+            # ========== FIX: Use GRVT's actual order price for quantity calculation ==========
+            # Get GRVT's BBO prices
+            grvt_bid, grvt_ask = await self.grvt_client.fetch_bbo_prices(self.config.contract_id)
 
-            # Calculate Paradex's actual order price (same logic as paradex.py:get_order_price)
-            if paradex_side == 'buy':
+            # Calculate GRVT's actual order price (same logic as grvt.py:get_order_price)
+            if grvt_side == 'buy':
                 # For buy orders, place slightly below best ask to ensure maker
-                paradex_order_price = paradex_ask - self.config.tick_size
+                grvt_order_price = grvt_ask - self.config.tick_size
             else:
                 # For sell orders, place slightly above best bid to ensure maker
-                paradex_order_price = paradex_bid + self.config.tick_size
+                grvt_order_price = grvt_bid + self.config.tick_size
 
             # Round to tick size
-            paradex_order_price = self.paradex_client.round_to_tick(paradex_order_price)
+            grvt_order_price = self.grvt_client.round_to_tick(grvt_order_price)
 
             # Validate price
-            if paradex_order_price <= 0:
-                self.logger.log(f"Invalid Paradex order price: {paradex_order_price}", "ERROR")
+            if grvt_order_price <= 0:
+                self.logger.log(f"Invalid GRVT order price: {grvt_order_price}", "ERROR")
                 return False
 
-            # Calculate quantity based on Paradex's actual order price (not average)
-            quantity = await self._calculate_quantity_from_margin(paradex_order_price, paradex_side)
+            # Calculate quantity based on GRVT's actual order price (not average)
+            quantity = await self._calculate_quantity_from_margin(grvt_order_price, grvt_side)
 
             # Get average price for monitoring/logging only
             avg_price = await self._get_average_price()
 
             self.logger.log(
-                f"Paradex {paradex_side.upper()} target: {quantity} @ {paradex_order_price} "
-                f"(bid={paradex_bid}, ask={paradex_ask}, avg_price={avg_price})",
+                f"GRVT {grvt_side.upper()} target: {quantity} @ {grvt_order_price} "
+                f"(bid={grvt_bid}, ask={grvt_ask}, avg_price={avg_price})",
                 "INFO"
             )
             # ========== END FIX ==========
 
-            # Step 1: Place POST_ONLY limit order on Paradex (maker)
-            self.logger.log(f"Placing Paradex {paradex_side.upper()} maker order...", "INFO")
+            # Step 1: Place POST_ONLY limit order on GRVT (maker)
+            self.logger.log(f"Placing GRVT {grvt_side.upper()} maker order...", "INFO")
             try:
-                paradex_result = await self.paradex_client.place_open_order(
-                    self.config.contract_id, quantity, paradex_side
+                grvt_result = await self.grvt_client.place_open_order(
+                    self.config.contract_id, quantity, grvt_side
                 )
             except Exception as e:
-                self.logger.log(f"Paradex order placement failed: {e}", "ERROR")
+                self.logger.log(f"GRVT order placement failed: {e}", "ERROR")
                 return False
 
-            if not paradex_result.success:
-                self.logger.log(f"Paradex order failed: {paradex_result.error_message}", "ERROR")
+            if not grvt_result.success:
+                self.logger.log(f"GRVT order failed: {grvt_result.error_message}", "ERROR")
                 return False
 
-            # Step 2: Wait for Paradex order to fill (with timeout)
-            self.logger.log(f"Waiting for Paradex order {paradex_result.order_id} to fill...", "INFO")
+            # Step 2: Wait for GRVT order to fill (with timeout)
+            self.logger.log(f"Waiting for GRVT order {grvt_result.order_id} to fill...", "INFO")
             timeout = 60  # 60 seconds timeout
             start_time = asyncio.get_event_loop().time()
             filled = False
 
             while asyncio.get_event_loop().time() - start_time < timeout:
-                order_info = await self.paradex_client.get_order_info(paradex_result.order_id)
+                order_info = await self.grvt_client.get_order_info(order_id=grvt_result.order_id)
 
-                if order_info and order_info.status == 'CLOSED' and order_info.filled_size > 0:
+                # GRVT uses 'FILLED' status (not Paradex's 'CLOSED')
+                if order_info and order_info.status == 'FILLED' and order_info.filled_size > 0:
                     filled = True
-                    paradex_result.filled_size = order_info.filled_size
-                    paradex_result.price = order_info.price
-                    self.logger.log(f"✓ Paradex order filled: {order_info.filled_size} @ {order_info.price}", "INFO")
+                    grvt_result.filled_size = order_info.filled_size
+                    grvt_result.price = order_info.price
+                    self.logger.log(f"✓ GRVT order filled: {order_info.filled_size} @ {order_info.price}", "INFO")
                     break
 
                 await asyncio.sleep(0.5)
 
             if not filled:
-                # Timeout - cancel Paradex order
-                self.logger.log(f"Paradex order not filled within {timeout}s, cancelling...", "WARNING")
-                await self.paradex_client.cancel_order(paradex_result.order_id)
+                # Timeout - cancel GRVT order
+                self.logger.log(f"GRVT order not filled within {timeout}s, cancelling...", "WARNING")
+                await self.grvt_client.cancel_order(grvt_result.order_id)
                 return False
 
             # Step 3: Immediately place Lighter market order to hedge
@@ -411,57 +316,57 @@ class CrossExchangeHedgeBot:
             try:
                 lighter_result = await self.lighter_client.place_market_order(
                     self.lighter_client.config.contract_id,
-                    paradex_result.filled_size,  # Use actual filled size from Paradex
+                    grvt_result.filled_size,  # Use actual filled size from GRVT
                     lighter_side
                 )
             except Exception as e:
                 self.logger.log(f"Lighter hedge failed: {e}", "ERROR")
-                # Rollback Paradex position
-                await self._rollback_paradex_position(paradex_result, 'sell' if paradex_side == 'buy' else 'buy')
+                # Rollback GRVT position
+                await self._rollback_grvt_position(grvt_result, 'sell' if grvt_side == 'buy' else 'buy')
                 return False
 
             # Check if Lighter order succeeded
             if not lighter_result.success or lighter_result.status != 'FILLED':
                 self.logger.log(f"Lighter order not filled: status={lighter_result.status}", "ERROR")
-                # Rollback Paradex
-                await self._rollback_paradex_position(paradex_result, 'sell' if paradex_side == 'buy' else 'buy')
+                # Rollback GRVT
+                await self._rollback_grvt_position(grvt_result, 'sell' if grvt_side == 'buy' else 'buy')
                 return False
 
             # Store position state
-            self.position.paradex_order_id = paradex_result.order_id
+            self.position.grvt_order_id = grvt_result.order_id
             self.position.lighter_order_id = lighter_result.order_id
-            self.position.paradex_entry_price = paradex_result.price
+            self.position.grvt_entry_price = grvt_result.price
             self.position.lighter_entry_price = lighter_result.price
-            self.position.paradex_quantity = paradex_result.filled_size
-            self.position.lighter_quantity = lighter_result.filled_size or paradex_result.filled_size
+            self.position.grvt_quantity = grvt_result.filled_size
+            self.position.lighter_quantity = lighter_result.filled_size or grvt_result.filled_size
             self.position.entry_time = asyncio.get_event_loop().time()
             self.position.is_open = True
 
             # ========== Calculate and verify actual notional values ==========
-            paradex_notional = self.position.paradex_quantity * self.position.paradex_entry_price
+            grvt_notional = self.position.grvt_quantity * self.position.grvt_entry_price
             lighter_notional = self.position.lighter_quantity * self.position.lighter_entry_price
             target_margin = self.config.margin
 
             # Calculate deviations
-            paradex_deviation_pct = abs(paradex_notional - target_margin) / target_margin * Decimal('100')
+            grvt_deviation_pct = abs(grvt_notional - target_margin) / target_margin * Decimal('100')
             lighter_deviation_pct = abs(lighter_notional - target_margin) / target_margin * Decimal('100')
 
-            self.logger.log(f"✓ Paradex {paradex_side.upper()} (maker): {self.position.paradex_quantity} @ {self.position.paradex_entry_price}", "INFO")
+            self.logger.log(f"✓ GRVT {grvt_side.upper()} (maker): {self.position.grvt_quantity} @ {self.position.grvt_entry_price}", "INFO")
             self.logger.log(f"✓ Lighter {lighter_side.upper()} (taker): {self.position.lighter_quantity} @ {self.position.lighter_entry_price}", "INFO")
 
-            # Log notional values with color-coded warnings
+            # Log notional values
             self.logger.log(
                 f"📊 Notional values - Target: {target_margin:.2f} USDC | "
-                f"Paradex: {paradex_notional:.2f} USDC ({paradex_deviation_pct:+.2f}%) | "
+                f"GRVT: {grvt_notional:.2f} USDC ({grvt_deviation_pct:+.2f}%) | "
                 f"Lighter: {lighter_notional:.2f} USDC ({lighter_deviation_pct:+.2f}%)",
                 "INFO"
             )
 
             # Warn if deviations are significant
-            if paradex_deviation_pct > Decimal('15'):
+            if grvt_deviation_pct > Decimal('15'):
                 self.logger.log(
-                    f"⚠️ Paradex notional deviation: {paradex_deviation_pct:.2f}% "
-                    f"(actual: {paradex_notional:.2f}, target: {target_margin:.2f})",
+                    f"⚠️ GRVT notional deviation: {grvt_deviation_pct:.2f}% "
+                    f"(actual: {grvt_notional:.2f}, target: {target_margin:.2f})",
                     "WARNING"
                 )
 
@@ -482,27 +387,27 @@ class CrossExchangeHedgeBot:
             self.logger.log(f"Traceback: {traceback.format_exc()}", "ERROR")
             return False
 
-    async def _rollback_paradex_position(self, order_result, close_side: str):
-        """Rollback a Paradex position by immediately closing it.
+    async def _rollback_grvt_position(self, order_result, close_side: str):
+        """Rollback a GRVT position by immediately closing it.
 
         Args:
             order_result: The order result to rollback
             close_side: Side to close ('buy' or 'sell')
         """
         try:
-            self.logger.log(f"Rolling back Paradex position: {order_result.filled_size} @ {order_result.price}", "WARNING")
+            self.logger.log(f"Rolling back GRVT position: {order_result.filled_size} @ {order_result.price}", "WARNING")
 
             if order_result.filled_size and order_result.filled_size > 0:
-                await self.paradex_client.place_market_order(
+                await self.grvt_client.place_market_order(
                     self.config.contract_id,
                     order_result.filled_size,
                     close_side
                 )
-                self.logger.log("Paradex rollback completed", "INFO")
+                self.logger.log("GRVT rollback completed", "INFO")
 
         except Exception as e:
-            self.logger.log(f"Error during Paradex rollback: {e}", "ERROR")
-            await self.send_notification(f"⚠️ CRITICAL: Paradex rollback failed: {e}")
+            self.logger.log(f"Error during GRVT rollback: {e}", "ERROR")
+            await self.send_notification(f"⚠️ CRITICAL: GRVT rollback failed: {e}")
 
     async def _check_stop_conditions(self) -> Tuple[bool, str]:
         """Check if stop-loss or take-profit conditions are met.
@@ -515,39 +420,39 @@ class CrossExchangeHedgeBot:
 
         try:
             # Get current prices
-            paradex_bid, paradex_ask = await self.paradex_client.fetch_bbo_prices(self.config.contract_id)
-            paradex_price = (Decimal(str(paradex_bid)) + Decimal(str(paradex_ask))) / Decimal('2')
+            grvt_bid, grvt_ask = await self.grvt_client.fetch_bbo_prices(self.config.contract_id)
+            grvt_price = (Decimal(str(grvt_bid)) + Decimal(str(grvt_ask))) / Decimal('2')
 
             lighter_bid, lighter_ask = await self.lighter_client.fetch_bbo_prices(self.lighter_client.config.contract_id)
             lighter_price = (Decimal(str(lighter_bid)) + Decimal(str(lighter_ask))) / Decimal('2')
 
             # Calculate P&L based on direction
             if self.config.reverse:
-                # Paradex SHORT + Lighter LONG
-                paradex_pnl_pct = ((self.position.paradex_entry_price - paradex_price) /
-                                   self.position.paradex_entry_price * Decimal('100'))
+                # GRVT SHORT + Lighter LONG
+                grvt_pnl_pct = ((self.position.grvt_entry_price - grvt_price) /
+                                   self.position.grvt_entry_price * Decimal('100'))
                 lighter_pnl_pct = ((lighter_price - self.position.lighter_entry_price) /
                                    self.position.lighter_entry_price * Decimal('100'))
             else:
-                # Paradex LONG + Lighter SHORT
-                paradex_pnl_pct = ((paradex_price - self.position.paradex_entry_price) /
-                                   self.position.paradex_entry_price * Decimal('100'))
+                # GRVT LONG + Lighter SHORT
+                grvt_pnl_pct = ((grvt_price - self.position.grvt_entry_price) /
+                                   self.position.grvt_entry_price * Decimal('100'))
                 lighter_pnl_pct = ((self.position.lighter_entry_price - lighter_price) /
                                    self.position.lighter_entry_price * Decimal('100'))
 
-            self.logger.log(f"P&L: Paradex={paradex_pnl_pct:.2f}%, Lighter={lighter_pnl_pct:.2f}%", "INFO")
+            self.logger.log(f"P&L: GRVT={grvt_pnl_pct:.2f}%, Lighter={lighter_pnl_pct:.2f}%", "INFO")
 
             # Check stop loss for either exchange
             stop_loss_threshold = -self.config.stop_loss
-            if paradex_pnl_pct <= stop_loss_threshold:
-                return True, f"Paradex Stop Loss triggered ({paradex_pnl_pct:.2f}%)"
+            if grvt_pnl_pct <= stop_loss_threshold:
+                return True, f"GRVT Stop Loss triggered ({grvt_pnl_pct:.2f}%)"
 
             if lighter_pnl_pct <= stop_loss_threshold:
                 return True, f"Lighter Stop Loss triggered ({lighter_pnl_pct:.2f}%)"
 
             # Check take profit for either exchange
-            if paradex_pnl_pct >= self.config.take_profit:
-                return True, f"Paradex Take Profit triggered ({paradex_pnl_pct:.2f}%)"
+            if grvt_pnl_pct >= self.config.take_profit:
+                return True, f"GRVT Take Profit triggered ({grvt_pnl_pct:.2f}%)"
 
             if lighter_pnl_pct >= self.config.take_profit:
                 return True, f"Lighter Take Profit triggered ({lighter_pnl_pct:.2f}%)"
@@ -559,11 +464,11 @@ class CrossExchangeHedgeBot:
             return False, ""
 
     async def _close_hedge_positions(self):
-        """Close hedged positions - Paradex uses maker limit order, Lighter uses market order.
+        """Close hedged positions - GRVT uses maker limit order, Lighter uses market order.
 
         Strategy:
-        1. Place POST_ONLY limit close order on Paradex (maker, low fees)
-        2. Wait for Paradex close order to fill
+        1. Place POST_ONLY limit close order on GRVT (maker, low fees)
+        2. Wait for GRVT close order to fill
         3. Once filled, immediately close Lighter position with market order (taker)
         """
         try:
@@ -575,44 +480,44 @@ class CrossExchangeHedgeBot:
 
             # Determine close sides based on reverse flag
             if self.config.reverse:
-                paradex_close_side = 'buy'   # Close SHORT
+                grvt_close_side = 'buy'   # Close SHORT
                 lighter_close_side = 'sell'  # Close LONG
             else:
-                paradex_close_side = 'sell'  # Close LONG
+                grvt_close_side = 'sell'  # Close LONG
                 lighter_close_side = 'buy'   # Close SHORT
 
-            # Get current prices for Paradex close order
-            paradex_bid, paradex_ask = await self.paradex_client.fetch_bbo_prices(self.config.contract_id)
+            # Get current prices for GRVT close order
+            grvt_bid, grvt_ask = await self.grvt_client.fetch_bbo_prices(self.config.contract_id)
 
             # Calculate close price for POST_ONLY order
-            if paradex_close_side == 'sell':
+            if grvt_close_side == 'sell':
                 # Selling: place slightly above best bid to ensure maker
-                close_price = paradex_bid + self.config.tick_size
+                close_price = grvt_bid + self.config.tick_size
             else:
                 # Buying: place slightly below best ask to ensure maker
-                close_price = paradex_ask - self.config.tick_size
+                close_price = grvt_ask - self.config.tick_size
 
-            # Step 1: Place POST_ONLY close order on Paradex (maker)
-            self.logger.log(f"Placing Paradex {paradex_close_side.upper()} maker close order @ {close_price}...", "INFO")
+            # Step 1: Place POST_ONLY close order on GRVT (maker)
+            self.logger.log(f"Placing GRVT {grvt_close_side.upper()} maker close order @ {close_price}...", "INFO")
             try:
-                paradex_close = await self.paradex_client.place_close_order(
+                grvt_close = await self.grvt_client.place_close_order(
                     self.config.contract_id,
-                    self.position.paradex_quantity,
+                    self.position.grvt_quantity,
                     close_price,
-                    paradex_close_side
+                    grvt_close_side
                 )
             except Exception as e:
-                self.logger.log(f"Paradex close order failed: {e}", "ERROR")
+                self.logger.log(f"GRVT close order failed: {e}", "ERROR")
                 # Force close with market order as fallback
-                self.logger.log("Falling back to Paradex market close order...", "WARNING")
-                paradex_close = await self.paradex_client.place_market_order(
+                self.logger.log("Falling back to GRVT market close order...", "WARNING")
+                grvt_close = await self.grvt_client.place_market_order(
                     self.config.contract_id,
-                    self.position.paradex_quantity,
-                    paradex_close_side
+                    self.position.grvt_quantity,
+                    grvt_close_side
                 )
 
-            if not paradex_close.success:
-                self.logger.log(f"Paradex close failed: {paradex_close.error_message}", "ERROR")
+            if not grvt_close.success:
+                self.logger.log(f"GRVT close failed: {grvt_close.error_message}", "ERROR")
                 # Still try to close Lighter
                 lighter_close = await self.lighter_client.place_market_order(
                     self.lighter_client.config.contract_id,
@@ -622,34 +527,34 @@ class CrossExchangeHedgeBot:
                 self.position = CrossPositionState()
                 return
 
-            # Step 2: Wait for Paradex close order to fill (with timeout)
-            self.logger.log(f"Waiting for Paradex close order {paradex_close.order_id} to fill...", "INFO")
+            # Step 2: Wait for GRVT close order to fill (with timeout)
+            self.logger.log(f"Waiting for GRVT close order {grvt_close.order_id} to fill...", "INFO")
             timeout = 60  # 60 seconds timeout
             start_time = asyncio.get_event_loop().time()
             filled = False
 
             while asyncio.get_event_loop().time() - start_time < timeout:
-                order_info = await self.paradex_client.get_order_info(paradex_close.order_id)
+                order_info = await self.grvt_client.get_order_info(order_id=grvt_close.order_id)
 
-                if order_info and order_info.status == 'CLOSED' and order_info.filled_size > 0:
+                if order_info and order_info.status == 'FILLED' and order_info.filled_size > 0:
                     filled = True
-                    paradex_close.filled_size = order_info.filled_size
-                    paradex_close.price = order_info.price
-                    self.logger.log(f"✓ Paradex closed: {order_info.filled_size} @ {order_info.price}", "INFO")
+                    grvt_close.filled_size = order_info.filled_size
+                    grvt_close.price = order_info.price
+                    self.logger.log(f"✓ GRVT closed: {order_info.filled_size} @ {order_info.price}", "INFO")
                     break
 
                 await asyncio.sleep(0.5)
 
             if not filled:
                 # Timeout - cancel and use market order
-                self.logger.log(f"Paradex close order not filled within {timeout}s, using market order...", "WARNING")
-                await self.paradex_client.cancel_order(paradex_close.order_id)
-                paradex_close = await self.paradex_client.place_market_order(
+                self.logger.log(f"GRVT close order not filled within {timeout}s, using market order...", "WARNING")
+                await self.grvt_client.cancel_order(grvt_close.order_id)
+                grvt_close = await self.grvt_client.place_market_order(
                     self.config.contract_id,
-                    self.position.paradex_quantity,
-                    paradex_close_side
+                    self.position.grvt_quantity,
+                    grvt_close_side
                 )
-                self.logger.log(f"✓ Paradex closed (market): {paradex_close.filled_size} @ {paradex_close.price}", "INFO")
+                self.logger.log(f"✓ GRVT closed (market): {grvt_close.filled_size} @ {grvt_close.price}", "INFO")
 
             # Step 3: Immediately close Lighter position with market order
             self.logger.log(f"Placing Lighter {lighter_close_side.upper()} market close order...", "INFO")
@@ -691,24 +596,25 @@ class CrossExchangeHedgeBot:
                 tg_bot.send_text(message)
 
     async def run(self):
-        """Main trading loop - continuous hedge cycle with 20s interval."""
+        """Main trading loop - continuous hedge cycle with configurable interval."""
         try:
             # Initialize clients
             await self.initialize()
 
             # Log configuration
-            self.logger.log("=== Cross-Exchange Hedge Bot Configuration ===", "INFO")
+            self.logger.log("=== GRVT ↔ Lighter Cross-Exchange Hedge Bot Configuration ===", "INFO")
             self.logger.log(f"Ticker: {self.config.ticker}", "INFO")
-            self.logger.log(f"Paradex Contract: {self.config.contract_id}", "INFO")
+            self.logger.log(f"GRVT Contract: {self.config.contract_id}", "INFO")
             self.logger.log(f"Lighter Contract: {self.lighter_client.config.contract_id}", "INFO")
             self.logger.log(f"Margin per trade: {self.config.margin} USDC", "INFO")
             self.logger.log(f"Hold time: {self.config.hold_time}s", "INFO")
             self.logger.log(f"Take Profit: {self.config.take_profit}%", "INFO")
             self.logger.log(f"Stop Loss: {self.config.stop_loss}%", "INFO")
             self.logger.log(f"Reverse mode: {self.config.reverse}", "INFO")
-            self.logger.log("==============================================", "INFO")
+            self.logger.log(f"Cycle wait: {self.config.cycle_wait}s", "INFO")
+            self.logger.log("=============================================================", "INFO")
 
-            # Continuous trading loop with 20s interval
+            # Continuous trading loop
             while not self.shutdown_requested:
                 try:
                     # Open hedge positions
@@ -756,7 +662,7 @@ class CrossExchangeHedgeBot:
         except Exception as e:
             self.logger.log(f"Critical error: {e}", "ERROR")
             self.logger.log(f"Traceback: {traceback.format_exc()}", "ERROR")
-            await self.send_notification(f"⚠️ Cross-Exchange Hedge Bot Critical Error: {e}")
+            await self.send_notification(f"⚠️ GRVT ↔ Lighter Hedge Bot Critical Error: {e}")
         finally:
             # Cleanup
             try:
@@ -764,11 +670,11 @@ class CrossExchangeHedgeBot:
                     self.logger.log("Closing open positions before shutdown...", "INFO")
                     await self._close_hedge_positions()
 
-                if self.paradex_client:
-                    await self.paradex_client.disconnect()
+                if self.grvt_client:
+                    await self.grvt_client.disconnect()
                 if self.lighter_client:
                     await self.lighter_client.disconnect()
 
-                self.logger.log("Cross-exchange hedge bot shutdown complete", "INFO")
+                self.logger.log("GRVT ↔ Lighter hedge bot shutdown complete", "INFO")
             except Exception as e:
                 self.logger.log(f"Error during shutdown: {e}", "ERROR")

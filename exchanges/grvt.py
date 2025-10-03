@@ -52,6 +52,9 @@ class GrvtClient(BaseExchangeClient):
         self._ws_client = None
         self._order_update_callback = None
 
+        # Order size increment (will be set in get_contract_attributes)
+        self.order_size_increment = Decimal(0)
+
     def _initialize_grvt_clients(self) -> None:
         """Initialize the GRVT REST and WebSocket clients."""
         try:
@@ -406,6 +409,107 @@ class GrvtClient(BaseExchangeClient):
             else:
                 raise Exception(f"[CLOSE] Unexpected order status: {order_status}")
 
+    async def place_market_order(self, contract_id: str, quantity: Decimal, side: str,
+                                  aggressive_offset: Decimal = Decimal('0.003')) -> OrderResult:
+        """Place aggressive limit order to simulate market order (taker).
+
+        Args:
+            contract_id: Market instrument ID
+            quantity: Order quantity
+            side: 'buy' or 'sell'
+            aggressive_offset: Price offset percentage to ensure immediate fill (default 0.3%)
+
+        Returns:
+            OrderResult with filled information
+        """
+        # Get current BBO
+        best_bid, best_ask = await self.fetch_bbo_prices(contract_id)
+
+        if best_bid <= 0 or best_ask <= 0 or best_bid >= best_ask:
+            raise ValueError("Invalid bid/ask prices")
+
+        # Calculate aggressive price for immediate fill
+        if side.lower() == 'buy':
+            # Buy at ask price + offset (aggressive buy)
+            price = best_ask * (Decimal('1') + aggressive_offset)
+        else:
+            # Sell at bid price - offset (aggressive sell)
+            price = best_bid * (Decimal('1') - aggressive_offset)
+
+        price = self.round_to_tick(price)
+
+        self.logger.log(
+            f"[MARKET] Placing GRVT {side} market order at {price} "
+            f"(bid={best_bid}, ask={best_ask})",
+            "INFO"
+        )
+
+        # Place limit order WITHOUT post_only (becomes taker order)
+        order_result = self.rest_client.create_limit_order(
+            symbol=contract_id,
+            side=side,
+            amount=quantity,
+            price=price,
+            params={}  # No post_only → taker order
+        )
+
+        if not order_result:
+            return OrderResult(
+                success=False,
+                error_message="Failed to place market order"
+            )
+
+        client_order_id = order_result.get('metadata', {}).get('client_order_id')
+        order_id = order_result.get('order_id', client_order_id)
+
+        # Wait for fill with timeout
+        import time
+        start_time = time.time()
+        timeout = 10  # 10 seconds for market order
+
+        while time.time() - start_time < timeout:
+            order_info = await self.get_order_info(order_id=order_id)
+
+            if order_info is None:
+                await asyncio.sleep(0.5)
+                continue
+
+            if order_info.status == 'FILLED' and order_info.filled_size > 0:
+                return OrderResult(
+                    success=True,
+                    order_id=order_id,
+                    side=side,
+                    size=quantity,
+                    price=order_info.price,
+                    status='FILLED',
+                    filled_size=order_info.filled_size
+                )
+            elif order_info.status in ['OPEN', 'PENDING']:
+                await asyncio.sleep(0.2)
+            else:
+                # REJECTED or CANCELLED
+                self.logger.log(
+                    f"[MARKET] Order failed: status={order_info.status}",
+                    "WARNING"
+                )
+                return OrderResult(
+                    success=False,
+                    error_message=f"Order status: {order_info.status}",
+                    order_id=order_id,
+                    status=order_info.status
+                )
+
+        # Timeout - try to cancel
+        self.logger.log(f"[MARKET] Order not filled within {timeout}s, cancelling", "WARNING")
+        await self.cancel_order(order_id)
+
+        return OrderResult(
+            success=False,
+            error_message=f"Market order not filled within {timeout}s",
+            order_id=order_id,
+            status='TIMEOUT'
+        )
+
     async def cancel_order(self, order_id: str) -> OrderResult:
         """Cancel an order with GRVT."""
         try:
@@ -524,8 +628,18 @@ class GrvtClient(BaseExchangeClient):
                 self.config.contract_id = market.get('instrument', '')
                 self.config.tick_size = Decimal(market.get('tick_size', 0))
 
-                # Validate minimum quantity
+                # Set order_size_increment using min_size (GRVT's quantity precision)
                 min_size = Decimal(market.get('min_size', 0))
+                self.order_size_increment = min_size
+
+                self.logger.log(
+                    f"GRVT market: {self.config.contract_id}, "
+                    f"tick_size={self.config.tick_size}, "
+                    f"order_size_increment={self.order_size_increment}",
+                    "INFO"
+                )
+
+                # Validate minimum quantity
                 if self.config.quantity < min_size:
                     raise ValueError(
                         f"Order quantity is less than min quantity: {self.config.quantity} < {min_size}"
