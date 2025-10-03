@@ -473,7 +473,13 @@ class CrossExchangeHedgeBot:
             return False, ""
 
     async def _close_hedge_positions(self):
-        """Close hedged positions on both exchanges simultaneously."""
+        """Close hedged positions - Paradex uses maker limit order, Lighter uses market order.
+
+        Strategy:
+        1. Place POST_ONLY limit close order on Paradex (maker, low fees)
+        2. Wait for Paradex close order to fill
+        3. Once filled, immediately close Lighter position with market order (taker)
+        """
         try:
             self.logger.log("=== Closing Cross-Exchange Hedge Positions ===", "INFO")
 
@@ -489,33 +495,92 @@ class CrossExchangeHedgeBot:
                 paradex_close_side = 'sell'  # Close LONG
                 lighter_close_side = 'buy'   # Close SHORT
 
-            # Close positions concurrently
-            results = await asyncio.gather(
-                self.paradex_client.place_market_order(
+            # Get current prices for Paradex close order
+            paradex_bid, paradex_ask = await self.paradex_client.fetch_bbo_prices(self.config.contract_id)
+
+            # Calculate close price for POST_ONLY order
+            if paradex_close_side == 'sell':
+                # Selling: place slightly above best bid to ensure maker
+                close_price = paradex_bid + self.config.tick_size
+            else:
+                # Buying: place slightly below best ask to ensure maker
+                close_price = paradex_ask - self.config.tick_size
+
+            # Step 1: Place POST_ONLY close order on Paradex (maker)
+            self.logger.log(f"Placing Paradex {paradex_close_side.upper()} maker close order @ {close_price}...", "INFO")
+            try:
+                paradex_close = await self.paradex_client.place_close_order(
+                    self.config.contract_id,
+                    self.position.paradex_quantity,
+                    close_price,
+                    paradex_close_side
+                )
+            except Exception as e:
+                self.logger.log(f"Paradex close order failed: {e}", "ERROR")
+                # Force close with market order as fallback
+                self.logger.log("Falling back to Paradex market close order...", "WARNING")
+                paradex_close = await self.paradex_client.place_market_order(
                     self.config.contract_id,
                     self.position.paradex_quantity,
                     paradex_close_side
-                ),
-                self.lighter_client.place_market_order(
+                )
+
+            if not paradex_close.success:
+                self.logger.log(f"Paradex close failed: {paradex_close.error_message}", "ERROR")
+                # Still try to close Lighter
+                lighter_close = await self.lighter_client.place_market_order(
                     self.lighter_client.config.contract_id,
                     self.position.lighter_quantity,
                     lighter_close_side
-                ),
-                return_exceptions=True
-            )
+                )
+                self.position = CrossPositionState()
+                return
 
-            paradex_close, lighter_close = results
+            # Step 2: Wait for Paradex close order to fill (with timeout)
+            self.logger.log(f"Waiting for Paradex close order {paradex_close.order_id} to fill...", "INFO")
+            timeout = 60  # 60 seconds timeout
+            start_time = asyncio.get_event_loop().time()
+            filled = False
 
-            # Log results
-            if isinstance(paradex_close, Exception):
-                self.logger.log(f"Paradex close failed: {paradex_close}", "ERROR")
-            else:
-                self.logger.log(f"✓ Paradex closed: {paradex_close.filled_size} @ {paradex_close.price}", "INFO")
+            while asyncio.get_event_loop().time() - start_time < timeout:
+                order_info = await self.paradex_client.get_order_info(paradex_close.order_id)
 
-            if isinstance(lighter_close, Exception):
-                self.logger.log(f"Lighter close failed: {lighter_close}", "ERROR")
-            else:
-                self.logger.log(f"✓ Lighter closed: {lighter_close.filled_size} @ {lighter_close.price}", "INFO")
+                if order_info and order_info.status == 'CLOSED' and order_info.filled_size > 0:
+                    filled = True
+                    paradex_close.filled_size = order_info.filled_size
+                    paradex_close.price = order_info.price
+                    self.logger.log(f"✓ Paradex closed: {order_info.filled_size} @ {order_info.price}", "INFO")
+                    break
+
+                await asyncio.sleep(0.5)
+
+            if not filled:
+                # Timeout - cancel and use market order
+                self.logger.log(f"Paradex close order not filled within {timeout}s, using market order...", "WARNING")
+                await self.paradex_client.cancel_order(paradex_close.order_id)
+                paradex_close = await self.paradex_client.place_market_order(
+                    self.config.contract_id,
+                    self.position.paradex_quantity,
+                    paradex_close_side
+                )
+                self.logger.log(f"✓ Paradex closed (market): {paradex_close.filled_size} @ {paradex_close.price}", "INFO")
+
+            # Step 3: Immediately close Lighter position with market order
+            self.logger.log(f"Placing Lighter {lighter_close_side.upper()} market close order...", "INFO")
+            try:
+                lighter_close = await self.lighter_client.place_market_order(
+                    self.lighter_client.config.contract_id,
+                    self.position.lighter_quantity,
+                    lighter_close_side
+                )
+
+                if lighter_close.success:
+                    self.logger.log(f"✓ Lighter closed: {lighter_close.filled_size} @ {lighter_close.price}", "INFO")
+                else:
+                    self.logger.log(f"Lighter close failed: status={lighter_close.status}", "ERROR")
+
+            except Exception as e:
+                self.logger.log(f"Lighter close failed: {e}", "ERROR")
 
             # Reset position state
             self.position = CrossPositionState()
