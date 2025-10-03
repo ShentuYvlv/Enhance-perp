@@ -280,7 +280,12 @@ class CrossExchangeHedgeBot:
         return avg_mid
 
     async def _open_hedge_positions(self) -> bool:
-        """Open hedged positions on both exchanges simultaneously.
+        """Open hedged positions - Paradex uses maker limit order, Lighter uses market order.
+
+        Strategy:
+        1. Place POST_ONLY limit order on Paradex (maker, low fees)
+        2. Wait for Paradex order to fill
+        3. Once filled, immediately hedge with Lighter market order (taker)
 
         Returns:
             True if both positions opened successfully, False otherwise
@@ -303,42 +308,67 @@ class CrossExchangeHedgeBot:
             if self.config.reverse:
                 paradex_side = 'sell'  # Paradex SHORT
                 lighter_side = 'buy'   # Lighter LONG
-                self.logger.log(f"Reverse mode: Paradex SHORT + Lighter LONG", "INFO")
+                self.logger.log(f"Reverse mode: Paradex SHORT (maker) + Lighter LONG (taker)", "INFO")
             else:
                 paradex_side = 'buy'   # Paradex LONG
                 lighter_side = 'sell'  # Lighter SHORT
-                self.logger.log(f"Normal mode: Paradex LONG + Lighter SHORT", "INFO")
+                self.logger.log(f"Normal mode: Paradex LONG (maker) + Lighter SHORT (taker)", "INFO")
 
             self.logger.log(f"Target: {quantity} @ avg_price {avg_price}", "INFO")
 
-            # Open positions concurrently
-            results = await asyncio.gather(
-                self.paradex_client.place_market_order(self.config.contract_id, quantity, paradex_side),
-                self.lighter_client.place_market_order(self.lighter_client.config.contract_id, quantity, lighter_side),
-                return_exceptions=True
-            )
-
-            paradex_result, lighter_result = results
-
-            # Check for exceptions
-            if isinstance(paradex_result, Exception):
-                self.logger.log(f"Paradex ({paradex_side.upper()}) failed: {paradex_result}", "ERROR")
+            # Step 1: Place POST_ONLY limit order on Paradex (maker)
+            self.logger.log(f"Placing Paradex {paradex_side.upper()} maker order...", "INFO")
+            try:
+                paradex_result = await self.paradex_client.place_open_order(
+                    self.config.contract_id, quantity, paradex_side
+                )
+            except Exception as e:
+                self.logger.log(f"Paradex order placement failed: {e}", "ERROR")
                 return False
 
-            if isinstance(lighter_result, Exception):
-                self.logger.log(f"Lighter ({lighter_side.upper()}) failed: {lighter_result}", "ERROR")
-                # Rollback Paradex
+            if not paradex_result.success:
+                self.logger.log(f"Paradex order failed: {paradex_result.error_message}", "ERROR")
+                return False
+
+            # Step 2: Wait for Paradex order to fill (with timeout)
+            self.logger.log(f"Waiting for Paradex order {paradex_result.order_id} to fill...", "INFO")
+            timeout = 60  # 60 seconds timeout
+            start_time = asyncio.get_event_loop().time()
+            filled = False
+
+            while asyncio.get_event_loop().time() - start_time < timeout:
+                order_info = await self.paradex_client.get_order_info(paradex_result.order_id)
+
+                if order_info and order_info.status == 'CLOSED' and order_info.filled_size > 0:
+                    filled = True
+                    paradex_result.filled_size = order_info.filled_size
+                    paradex_result.price = order_info.price
+                    self.logger.log(f"✓ Paradex order filled: {order_info.filled_size} @ {order_info.price}", "INFO")
+                    break
+
+                await asyncio.sleep(0.5)
+
+            if not filled:
+                # Timeout - cancel Paradex order
+                self.logger.log(f"Paradex order not filled within {timeout}s, cancelling...", "WARNING")
+                await self.paradex_client.cancel_order(paradex_result.order_id)
+                return False
+
+            # Step 3: Immediately place Lighter market order to hedge
+            self.logger.log(f"Placing Lighter {lighter_side.upper()} market order to hedge...", "INFO")
+            try:
+                lighter_result = await self.lighter_client.place_market_order(
+                    self.lighter_client.config.contract_id,
+                    paradex_result.filled_size,  # Use actual filled size from Paradex
+                    lighter_side
+                )
+            except Exception as e:
+                self.logger.log(f"Lighter hedge failed: {e}", "ERROR")
+                # Rollback Paradex position
                 await self._rollback_paradex_position(paradex_result, 'sell' if paradex_side == 'buy' else 'buy')
                 return False
 
-            # Check if both orders succeeded and filled
-            if not paradex_result.success or paradex_result.status != 'FILLED':
-                self.logger.log(f"Paradex order not filled: status={paradex_result.status}", "ERROR")
-                # Try to rollback if partial fill
-                if paradex_result.filled_size and paradex_result.filled_size > 0:
-                    await self._rollback_paradex_position(paradex_result, 'sell' if paradex_side == 'buy' else 'buy')
-                return False
-
+            # Check if Lighter order succeeded
             if not lighter_result.success or lighter_result.status != 'FILLED':
                 self.logger.log(f"Lighter order not filled: status={lighter_result.status}", "ERROR")
                 # Rollback Paradex
@@ -350,13 +380,13 @@ class CrossExchangeHedgeBot:
             self.position.lighter_order_id = lighter_result.order_id
             self.position.paradex_entry_price = paradex_result.price
             self.position.lighter_entry_price = lighter_result.price
-            self.position.paradex_quantity = paradex_result.filled_size or quantity
-            self.position.lighter_quantity = lighter_result.filled_size or quantity
+            self.position.paradex_quantity = paradex_result.filled_size
+            self.position.lighter_quantity = lighter_result.filled_size or paradex_result.filled_size
             self.position.entry_time = asyncio.get_event_loop().time()
             self.position.is_open = True
 
-            self.logger.log(f"✓ Paradex {paradex_side.upper()}: {self.position.paradex_quantity} @ {self.position.paradex_entry_price}", "INFO")
-            self.logger.log(f"✓ Lighter {lighter_side.upper()}: {self.position.lighter_quantity} @ {self.position.lighter_entry_price}", "INFO")
+            self.logger.log(f"✓ Paradex {paradex_side.upper()} (maker): {self.position.paradex_quantity} @ {self.position.paradex_entry_price}", "INFO")
+            self.logger.log(f"✓ Lighter {lighter_side.upper()} (taker): {self.position.lighter_quantity} @ {self.position.lighter_entry_price}", "INFO")
             self.logger.log("=== Cross-Exchange Hedge Positions Opened Successfully ===", "INFO")
 
             return True
