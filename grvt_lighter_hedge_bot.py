@@ -464,12 +464,13 @@ class GrvtLighterHedgeBot:
             return False, ""
 
     async def _close_hedge_positions(self):
-        """Close hedged positions - GRVT uses maker limit order, Lighter uses market order.
+        """Close hedged positions - GRVT uses POST_ONLY limit order, Lighter uses market order.
 
         Strategy:
-        1. Place POST_ONLY limit close order on GRVT (maker, low fees)
-        2. Wait for GRVT close order to fill
-        3. Once filled, immediately close Lighter position with market order (taker)
+        1. Place POST_ONLY limit close order on GRVT (maker, low fees, NO market fallback)
+        2. Wait for GRVT close order to fill (60s timeout)
+        3. Once GRVT filled, immediately close Lighter position with market order (taker)
+        4. If GRVT not filled, cancel and retry in next cycle
         """
         try:
             self.logger.log("=== Closing Cross-Exchange Hedge Positions ===", "INFO")
@@ -498,7 +499,7 @@ class GrvtLighterHedgeBot:
                 close_price = grvt_ask - self.config.tick_size
 
             # Step 1: Place POST_ONLY close order on GRVT (maker)
-            self.logger.log(f"Placing GRVT {grvt_close_side.upper()} maker close order @ {close_price}...", "INFO")
+            self.logger.log(f"Placing GRVT {grvt_close_side.upper()} POST_ONLY close order @ {close_price}...", "INFO")
             try:
                 grvt_close = await self.grvt_client.place_close_order(
                     self.config.contract_id,
@@ -507,24 +508,13 @@ class GrvtLighterHedgeBot:
                     grvt_close_side
                 )
             except Exception as e:
-                self.logger.log(f"GRVT close order failed: {e}", "ERROR")
-                # Force close with market order as fallback
-                self.logger.log("Falling back to GRVT market close order...", "WARNING")
-                grvt_close = await self.grvt_client.place_market_order(
-                    self.config.contract_id,
-                    self.position.grvt_quantity,
-                    grvt_close_side
-                )
+                self.logger.log(f"GRVT POST_ONLY close order failed: {e}", "ERROR")
+                self.logger.log("⚠️ Position remains open, will retry in next cycle", "WARNING")
+                return
 
             if not grvt_close.success:
                 self.logger.log(f"GRVT close failed: {grvt_close.error_message}", "ERROR")
-                # Still try to close Lighter
-                lighter_close = await self.lighter_client.place_market_order(
-                    self.lighter_client.config.contract_id,
-                    self.position.lighter_quantity,
-                    lighter_close_side
-                )
-                self.position = CrossPositionState()
+                self.logger.log("⚠️ Position remains open, will retry in next cycle", "WARNING")
                 return
 
             # Step 2: Wait for GRVT close order to fill (with timeout)
@@ -540,23 +530,19 @@ class GrvtLighterHedgeBot:
                     filled = True
                     grvt_close.filled_size = order_info.filled_size
                     grvt_close.price = order_info.price
-                    self.logger.log(f"✓ GRVT closed: {order_info.filled_size} @ {order_info.price}", "INFO")
+                    self.logger.log(f"✓ GRVT closed (POST_ONLY): {order_info.filled_size} @ {order_info.price}", "INFO")
                     break
 
                 await asyncio.sleep(0.5)
 
             if not filled:
-                # Timeout - cancel and use market order
-                self.logger.log(f"GRVT close order not filled within {timeout}s, using market order...", "WARNING")
+                # Timeout - cancel order and keep position open for retry (NO market order fallback)
+                self.logger.log(f"⚠️ GRVT close order not filled within {timeout}s, canceling order...", "WARNING")
                 await self.grvt_client.cancel_order(grvt_close.order_id)
-                grvt_close = await self.grvt_client.place_market_order(
-                    self.config.contract_id,
-                    self.position.grvt_quantity,
-                    grvt_close_side
-                )
-                self.logger.log(f"✓ GRVT closed (market): {grvt_close.filled_size} @ {grvt_close.price}", "INFO")
+                self.logger.log("⚠️ Position remains open, will retry in next cycle", "WARNING")
+                return
 
-            # Step 3: Immediately close Lighter position with market order
+            # Step 3: Immediately close Lighter position with market order (taker, fast execution)
             self.logger.log(f"Placing Lighter {lighter_close_side.upper()} market close order...", "INFO")
             try:
                 lighter_close = await self.lighter_client.place_market_order(
@@ -566,12 +552,14 @@ class GrvtLighterHedgeBot:
                 )
 
                 if lighter_close.success:
-                    self.logger.log(f"✓ Lighter closed: {lighter_close.filled_size} @ {lighter_close.price}", "INFO")
+                    self.logger.log(f"✓ Lighter closed (market): {lighter_close.filled_size} @ {lighter_close.price}", "INFO")
                 else:
                     self.logger.log(f"Lighter close failed: status={lighter_close.status}", "ERROR")
+                    self.logger.log("⚠️ GRVT closed but Lighter still open - POSITION IMBALANCE", "ERROR")
 
             except Exception as e:
                 self.logger.log(f"Lighter close failed: {e}", "ERROR")
+                self.logger.log("⚠️ GRVT closed but Lighter still open - POSITION IMBALANCE", "ERROR")
 
             # Reset position state
             self.position = CrossPositionState()

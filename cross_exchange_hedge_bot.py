@@ -559,12 +559,13 @@ class CrossExchangeHedgeBot:
             return False, ""
 
     async def _close_hedge_positions(self):
-        """Close hedged positions - Paradex uses maker limit order, Lighter uses market order.
+        """Close hedged positions - Paradex uses POST_ONLY limit order, Lighter uses market order.
 
         Strategy:
-        1. Place POST_ONLY limit close order on Paradex (maker, low fees)
-        2. Wait for Paradex close order to fill
-        3. Once filled, immediately close Lighter position with market order (taker)
+        1. Place POST_ONLY limit close order on Paradex (maker, low fees, NO market fallback)
+        2. Wait for Paradex close order to fill (60s timeout)
+        3. Once Paradex filled, immediately close Lighter position with market order (taker)
+        4. If Paradex not filled, cancel and retry in next cycle
         """
         try:
             self.logger.log("=== Closing Cross-Exchange Hedge Positions ===", "INFO")
@@ -593,7 +594,7 @@ class CrossExchangeHedgeBot:
                 close_price = paradex_ask - self.config.tick_size
 
             # Step 1: Place POST_ONLY close order on Paradex (maker)
-            self.logger.log(f"Placing Paradex {paradex_close_side.upper()} maker close order @ {close_price}...", "INFO")
+            self.logger.log(f"Placing Paradex {paradex_close_side.upper()} POST_ONLY close order @ {close_price}...", "INFO")
             try:
                 paradex_close = await self.paradex_client.place_close_order(
                     self.config.contract_id,
@@ -602,24 +603,13 @@ class CrossExchangeHedgeBot:
                     paradex_close_side
                 )
             except Exception as e:
-                self.logger.log(f"Paradex close order failed: {e}", "ERROR")
-                # Force close with market order as fallback
-                self.logger.log("Falling back to Paradex market close order...", "WARNING")
-                paradex_close = await self.paradex_client.place_market_order(
-                    self.config.contract_id,
-                    self.position.paradex_quantity,
-                    paradex_close_side
-                )
+                self.logger.log(f"Paradex POST_ONLY close order failed: {e}", "ERROR")
+                self.logger.log("⚠️ Position remains open, will retry in next cycle", "WARNING")
+                return
 
             if not paradex_close.success:
                 self.logger.log(f"Paradex close failed: {paradex_close.error_message}", "ERROR")
-                # Still try to close Lighter
-                lighter_close = await self.lighter_client.place_market_order(
-                    self.lighter_client.config.contract_id,
-                    self.position.lighter_quantity,
-                    lighter_close_side
-                )
-                self.position = CrossPositionState()
+                self.logger.log("⚠️ Position remains open, will retry in next cycle", "WARNING")
                 return
 
             # Step 2: Wait for Paradex close order to fill (with timeout)
@@ -635,23 +625,19 @@ class CrossExchangeHedgeBot:
                     filled = True
                     paradex_close.filled_size = order_info.filled_size
                     paradex_close.price = order_info.price
-                    self.logger.log(f"✓ Paradex closed: {order_info.filled_size} @ {order_info.price}", "INFO")
+                    self.logger.log(f"✓ Paradex closed (POST_ONLY): {order_info.filled_size} @ {order_info.price}", "INFO")
                     break
 
                 await asyncio.sleep(0.5)
 
             if not filled:
-                # Timeout - cancel and use market order
-                self.logger.log(f"Paradex close order not filled within {timeout}s, using market order...", "WARNING")
+                # Timeout - cancel order and keep position open for retry (NO market order fallback)
+                self.logger.log(f"⚠️ Paradex close order not filled within {timeout}s, canceling order...", "WARNING")
                 await self.paradex_client.cancel_order(paradex_close.order_id)
-                paradex_close = await self.paradex_client.place_market_order(
-                    self.config.contract_id,
-                    self.position.paradex_quantity,
-                    paradex_close_side
-                )
-                self.logger.log(f"✓ Paradex closed (market): {paradex_close.filled_size} @ {paradex_close.price}", "INFO")
+                self.logger.log("⚠️ Position remains open, will retry in next cycle", "WARNING")
+                return
 
-            # Step 3: Immediately close Lighter position with market order
+            # Step 3: Immediately close Lighter position with market order (taker, fast execution)
             self.logger.log(f"Placing Lighter {lighter_close_side.upper()} market close order...", "INFO")
             try:
                 lighter_close = await self.lighter_client.place_market_order(
@@ -661,12 +647,14 @@ class CrossExchangeHedgeBot:
                 )
 
                 if lighter_close.success:
-                    self.logger.log(f"✓ Lighter closed: {lighter_close.filled_size} @ {lighter_close.price}", "INFO")
+                    self.logger.log(f"✓ Lighter closed (market): {lighter_close.filled_size} @ {lighter_close.price}", "INFO")
                 else:
                     self.logger.log(f"Lighter close failed: status={lighter_close.status}", "ERROR")
+                    self.logger.log("⚠️ Paradex closed but Lighter still open - POSITION IMBALANCE", "ERROR")
 
             except Exception as e:
                 self.logger.log(f"Lighter close failed: {e}", "ERROR")
+                self.logger.log("⚠️ Paradex closed but Lighter still open - POSITION IMBALANCE", "ERROR")
 
             # Reset position state
             self.position = CrossPositionState()
