@@ -514,41 +514,33 @@ class ParadexClient(BaseExchangeClient):
 
     async def place_market_order(self, contract_id: str, quantity: Decimal, side: str,
                                   aggressive_offset: Decimal = Decimal('0.003')) -> OrderResult:
-        """Place a market order using aggressive limit order pricing.
+        """Place a true market order using Paradex SDK OrderType.Market.
 
         Args:
             contract_id: Market ID
             quantity: Order quantity
             side: 'buy' or 'sell'
-            aggressive_offset: Price offset percentage to ensure immediate fill (default 0.3%)
+            aggressive_offset: Unused (kept for API compatibility)
 
         Returns:
             OrderResult with order details
         """
-        from paradex_py.common.order import OrderSide
+        from paradex_py.common.order import Order, OrderType, OrderSide
 
-        # Get current market prices
-        best_bid, best_ask = await self.fetch_bbo_prices(contract_id)
-
-        if best_bid <= 0 or best_ask <= 0 or best_bid >= best_ask:
-            raise ValueError("Invalid bid/ask prices")
-
-        # Calculate aggressive price for immediate fill
+        # Convert side to OrderSide enum
         if side.lower() == 'buy':
-            # Buy: pay above best ask to ensure fill
-            aggressive_price = best_ask * (Decimal('1') + aggressive_offset)
             order_side = OrderSide.Buy
         elif side.lower() == 'sell':
-            # Sell: sell below best bid to ensure fill
-            aggressive_price = best_bid * (Decimal('1') - aggressive_offset)
             order_side = OrderSide.Sell
         else:
             raise ValueError(f"Invalid side: {side}")
 
-        aggressive_price = self.round_to_tick(aggressive_price)
+        # Get current market price for notional validation
+        best_bid, best_ask = await self.fetch_bbo_prices(contract_id)
+        mid_price = (best_bid + best_ask) / Decimal('2')
 
-        # Validate order notional against min_notional
-        order_notional = quantity * aggressive_price
+        # Validate order notional against min_notional (using mid price estimate)
+        order_notional = quantity * mid_price
         if self.min_notional > 0 and order_notional < self.min_notional:
             error_msg = f"Order notional {order_notional} < min_notional {self.min_notional}"
             self.logger.log(f"[MARKET] {error_msg}", "ERROR")
@@ -557,11 +549,27 @@ class ParadexClient(BaseExchangeClient):
                 error_message=error_msg
             )
 
-        self.logger.log(f"[MARKET] Placing {side} market order: {quantity} @ {aggressive_price} "
-                       f"(bid={best_bid}, ask={best_ask}, notional={order_notional})", "INFO")
+        self.logger.log(f"[MARKET] Placing {side} MARKET order: {quantity} "
+                       f"(bid={best_bid}, ask={best_ask}, est_notional={order_notional})", "INFO")
 
-        # Place limit order with aggressive price
-        order_result = await self.place_post_only_order(contract_id, quantity, aggressive_price, order_side)
+        # Create true MARKET order (no limit_price needed)
+        order = Order(
+            market=contract_id,
+            order_type=OrderType.Market,
+            order_side=order_side,
+            size=quantity.quantize(self.order_size_increment, rounding=ROUND_HALF_UP),
+        )
+
+        # Submit order
+        order_result = self._submit_order_with_retry(order)
+
+        # Extract order ID from response
+        order_id = order_result.get('id')
+        if not order_id:
+            return OrderResult(
+                success=False,
+                error_message='No order ID in response'
+            )
 
         # Wait for order to fill or timeout
         import time
@@ -569,7 +577,7 @@ class ParadexClient(BaseExchangeClient):
         timeout = 10
 
         while time.time() - start_time < timeout:
-            order_info = await self.get_order_info(order_result.order_id)
+            order_info = await self.get_order_info(order_id)
 
             if order_info is None:
                 await asyncio.sleep(0.5)
@@ -579,7 +587,7 @@ class ParadexClient(BaseExchangeClient):
                 # Order filled
                 return OrderResult(
                     success=True,
-                    order_id=order_result.order_id,
+                    order_id=order_id,
                     side=side,
                     size=quantity,
                     price=order_info.price,
@@ -591,17 +599,23 @@ class ParadexClient(BaseExchangeClient):
                 await asyncio.sleep(0.2)
             else:
                 # Unexpected status
-                self.logger.log(f"[MARKET] Unexpected status: {order_info.status}", "WARNING")
-                break
+                self.logger.log(f"[MARKET] Unexpected status: {order_info.status}, cancel_reason: {order_info.cancel_reason}", "WARNING")
+                return OrderResult(
+                    success=False,
+                    error_message=f"Order failed: status={order_info.status}, reason={order_info.cancel_reason}",
+                    order_id=order_id,
+                    status=order_info.status
+                )
 
-        # Timeout or unexpected status - cancel order
+        # Timeout - try to cancel order
         self.logger.log(f"[MARKET] Order not filled within {timeout}s, cancelling", "WARNING")
-        await self.cancel_order(order_result.order_id)
+        await self.cancel_order(order_id)
 
         return OrderResult(
             success=False,
             error_message=f"Market order not filled within {timeout}s",
-            order_id=order_result.order_id
+            order_id=order_id,
+            status='TIMEOUT'
         )
 
     async def cancel_order(self, order_id: str) -> OrderResult:

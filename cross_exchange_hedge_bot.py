@@ -92,28 +92,60 @@ class CrossExchangeHedgeBot:
 
             # Initialize Lighter Client
             self.logger.log("Connecting to Lighter...", "INFO")
+
+            # Debug: Print Lighter credentials
+            import os
+            lighter_account_index = os.getenv('LIGHTER_ACCOUNT_INDEX', 'NOT SET')
+            lighter_api_key_index = os.getenv('LIGHTER_API_KEY_INDEX', 'NOT SET')
+            api_key_exists = 'YES' if os.getenv('API_KEY_PRIVATE_KEY') else 'NO'
+            self.logger.log(f"[DEBUG] Lighter Config: ACCOUNT_INDEX={lighter_account_index}, "
+                          f"API_KEY_INDEX={lighter_api_key_index}, API_KEY_EXISTS={api_key_exists}", "INFO")
+
+            # Create Lighter config
             lighter_config = self._create_client_config(self.config.ticker, 'lighter')
             self.lighter_client = LighterClient(lighter_config)
-            await self.lighter_client.connect()
 
-            # Get Lighter contract attributes
+            # CRITICAL: Get contract_id BEFORE connecting to ensure WebSocket subscribes to correct channel
+            # This must be done before connect() because WebSocket uses contract_id for subscription
             lighter_contract_id, lighter_tick_size = await self.lighter_client.get_contract_attributes()
             self.logger.log(f"Lighter: {self.config.ticker} = Market ID {lighter_contract_id}", "INFO")
+
+            # Set contract_id in client config BEFORE connecting
+            self.lighter_client.config.contract_id = lighter_contract_id
+            self.lighter_client.config.tick_size = lighter_tick_size
+
+            # Now connect with correct contract_id set
+            await self.lighter_client.connect()
 
             # Store contract info (use Paradex's for general config)
             self.config.contract_id = paradex_contract_id
             self.config.tick_size = paradex_tick_size
 
-            # Store Lighter contract ID in client config
-            self.lighter_client.config.contract_id = lighter_contract_id
-            self.lighter_client.config.tick_size = lighter_tick_size
-
             # Wait for WebSocket connections to be fully established
             self.logger.log("Waiting for WebSocket connections to establish...", "INFO")
-            await asyncio.sleep(5)
+            await asyncio.sleep(10)
 
-            # Check account balances
-            await self._check_account_balances()
+            # Verify WebSocket connections are ready
+            max_retries = 10
+            for i in range(max_retries):
+                paradex_ready = True  # Paradex usually ready immediately
+                lighter_ready = (hasattr(self.lighter_client, 'ws_manager') and
+                                self.lighter_client.ws_manager and
+                                self.lighter_client.ws_manager.best_bid)
+
+                if lighter_ready:
+                    self.logger.log("WebSocket connections established and data streaming", "INFO")
+                    break
+                else:
+                    self.logger.log(f"Waiting for Lighter WebSocket data... ({i+1}/{max_retries})", "INFO")
+                    await asyncio.sleep(2)
+
+            if not lighter_ready:
+                self.logger.log("Warning: Lighter WebSocket may not be fully ready", "WARNING")
+
+            # Note: Balance check removed - leverage is set at exchange account level
+            # Exchange APIs will return error if insufficient margin for the position
+            # This allows users with high leverage (e.g., 35x) to trade with smaller balances
 
             self.logger.log("Both exchanges initialized successfully", "INFO")
 
@@ -127,9 +159,60 @@ class CrossExchangeHedgeBot:
         try:
             # Get balances
             paradex_balance = await self.paradex_client.get_account_balance()
+
+            # ========== Lighter Balance Debugging ==========
+            import lighter
+            account_api = lighter.AccountApi(self.lighter_client.api_client)
+            account_data = await account_api.account(
+                by="index",
+                value=str(self.lighter_client.account_index)
+            )
+
+            self.logger.log(f"[DEBUG] Lighter API Response:", "INFO")
+            self.logger.log(f"  - account_data type: {type(account_data)}", "INFO")
+            self.logger.log(f"  - account_data.total: {account_data.total}", "INFO")
+            self.logger.log(f"  - account_data.accounts length: {len(account_data.accounts)}", "INFO")
+
+            if account_data.accounts:
+                acc = account_data.accounts[0]
+                self.logger.log(f"  - available_balance: {acc.available_balance}", "INFO")
+                self.logger.log(f"  - collateral: {acc.collateral}", "INFO")
+                self.logger.log(f"  - total_asset_value: {acc.total_asset_value}", "INFO")
+                self.logger.log(f"  - cross_asset_value: {acc.cross_asset_value}", "INFO")
+
+                # Test different interpretations
+                if acc.available_balance is not None:
+                    try:
+                        avail_as_decimal = Decimal(acc.available_balance)
+                        avail_divided = avail_as_decimal / Decimal('1e6')
+                        self.logger.log(f"  - available_balance as Decimal: {avail_as_decimal}", "INFO")
+                        self.logger.log(f"  - available_balance / 1e6: {avail_divided}", "INFO")
+                    except Exception as e:
+                        self.logger.log(f"  - Error parsing available_balance: {e}", "ERROR")
+
+                try:
+                    collateral_as_decimal = Decimal(acc.collateral)
+                    collateral_divided = collateral_as_decimal / Decimal('1e6')
+                    self.logger.log(f"  - collateral as Decimal: {collateral_as_decimal}", "INFO")
+                    self.logger.log(f"  - collateral / 1e6: {collateral_divided}", "INFO")
+                except Exception as e:
+                    self.logger.log(f"  - Error parsing collateral: {e}", "ERROR")
+
+                try:
+                    total_asset_as_decimal = Decimal(acc.total_asset_value)
+                    total_asset_divided = total_asset_as_decimal / Decimal('1e6')
+                    self.logger.log(f"  - total_asset_value as Decimal: {total_asset_as_decimal}", "INFO")
+                    self.logger.log(f"  - total_asset_value / 1e6: {total_asset_divided}", "INFO")
+                except Exception as e:
+                    self.logger.log(f"  - Error parsing total_asset_value: {e}", "ERROR")
+            # ========== End Debugging ==========
+
             lighter_balance = await self.lighter_client.get_account_balance()
 
-            required_balance = self.config.margin * Decimal('2')  # 2x safety margin
+            # Calculate required balance with more reasonable safety margin
+            # 1.2x accounts for: initial margin + maintenance margin buffer + fees + slippage
+            # Original 2x was overly conservative and blocked valid trades
+            required_balance = self.config.margin * Decimal('1.2')
 
             self.logger.log(f"Paradex balance: {paradex_balance} USDC (required: {required_balance})", "INFO")
             self.logger.log(f"Lighter balance: {lighter_balance} USDC (required: {required_balance})", "INFO")

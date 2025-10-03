@@ -590,9 +590,14 @@ class LighterClient(BaseExchangeClient):
             # Get first account from the list
             account_info = account_data.accounts[0]
 
-            # Get available balance (in USDC, adjusted for decimals)
-            # Lighter uses 6 decimals for USDC
-            available_balance = Decimal(account_info.available_balance) / Decimal('1e6')
+            # Get available balance (in USDC)
+            # Note: Lighter SDK v0.1.4+ returns balance as human-readable string (already in USDC)
+            # No need to divide by 1e6 as the SDK has already converted it
+            if account_info.available_balance is not None:
+                available_balance = Decimal(account_info.available_balance)
+            else:
+                # Fallback to collateral if available_balance is None
+                available_balance = Decimal(account_info.collateral)
 
             self.logger.log(f"Account balance: {available_balance} USDC", "INFO")
             return available_balance
