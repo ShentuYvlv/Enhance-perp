@@ -300,6 +300,13 @@ class GrvtClient(BaseExchangeClient):
 
     async def place_open_order(self, contract_id: str, quantity: Decimal, direction: str) -> OrderResult:
         """Place an open order with GRVT."""
+        # Validate quantity against minimum size
+        if self.order_size_increment > 0 and quantity < self.order_size_increment:
+            return OrderResult(
+                success=False,
+                error_message=f"Order quantity {quantity} is less than min size {self.order_size_increment}"
+            )
+
         attempt = 0
         while True:
             attempt += 1
@@ -356,6 +363,13 @@ class GrvtClient(BaseExchangeClient):
 
     async def place_close_order(self, contract_id: str, quantity: Decimal, price: Decimal, side: str) -> OrderResult:
         """Place a close order with GRVT."""
+        # Validate quantity against minimum size
+        if self.order_size_increment > 0 and quantity < self.order_size_increment:
+            return OrderResult(
+                success=False,
+                error_message=f"Order quantity {quantity} is less than min size {self.order_size_increment}"
+            )
+
         # Get current market prices
         attempt = 0
         active_close_orders = await self._get_active_close_orders(contract_id)
@@ -422,6 +436,13 @@ class GrvtClient(BaseExchangeClient):
         Returns:
             OrderResult with filled information
         """
+        # Validate quantity against minimum size
+        if self.order_size_increment > 0 and quantity < self.order_size_increment:
+            return OrderResult(
+                success=False,
+                error_message=f"Order quantity {quantity} is less than min size {self.order_size_increment}"
+            )
+
         # Get current BBO
         best_bid, best_ask = await self.fetch_bbo_prices(contract_id)
 
@@ -639,8 +660,9 @@ class GrvtClient(BaseExchangeClient):
                     "INFO"
                 )
 
-                # Validate minimum quantity
-                if self.config.quantity < min_size:
+                # Validate minimum quantity (only if quantity is set)
+                # For cross-hedge bots, quantity is 0 at init and calculated dynamically
+                if self.config.quantity > 0 and self.config.quantity < min_size:
                     raise ValueError(
                         f"Order quantity is less than min quantity: {self.config.quantity} < {min_size}"
                     )

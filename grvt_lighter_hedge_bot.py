@@ -22,8 +22,10 @@ class CrossHedgeConfig:
     ticker: str
     margin: Decimal  # Margin per trade in USDC
     hold_time: int  # Position hold time in seconds
-    take_profit: Decimal  # Take profit percentage (default 50%)
-    stop_loss: Decimal  # Stop loss percentage (default 50%)
+    take_profit: Decimal  # Take profit percentage (default 50%, deprecated - use max_profit_usdc)
+    stop_loss: Decimal  # Stop loss percentage (default 50%, deprecated - use max_loss_usdc)
+    max_loss_usdc: Decimal = Decimal('50')  # Maximum loss in USDC before stop loss
+    max_profit_usdc: Decimal = Decimal('100')  # Maximum profit in USDC for take profit (optional)
     reverse: bool = False  # Reverse direction (GRVT SHORT + Lighter LONG)
     cycle_wait: int = 20  # Wait time between trading cycles in seconds
     contract_id: str = ''
@@ -410,7 +412,7 @@ class GrvtLighterHedgeBot:
             await self.send_notification(f"⚠️ CRITICAL: GRVT rollback failed: {e}")
 
     async def _check_stop_conditions(self) -> Tuple[bool, str]:
-        """Check if stop-loss or take-profit conditions are met.
+        """Check if stop-loss or take-profit conditions are met (using absolute USDC values).
 
         Returns:
             Tuple of (should_close, reason)
@@ -426,36 +428,37 @@ class GrvtLighterHedgeBot:
             lighter_bid, lighter_ask = await self.lighter_client.fetch_bbo_prices(self.lighter_client.config.contract_id)
             lighter_price = (Decimal(str(lighter_bid)) + Decimal(str(lighter_ask))) / Decimal('2')
 
-            # Calculate P&L based on direction
+            # Calculate absolute P&L in USDC based on direction
             if self.config.reverse:
                 # GRVT SHORT + Lighter LONG
-                grvt_pnl_pct = ((self.position.grvt_entry_price - grvt_price) /
-                                   self.position.grvt_entry_price * Decimal('100'))
-                lighter_pnl_pct = ((lighter_price - self.position.lighter_entry_price) /
-                                   self.position.lighter_entry_price * Decimal('100'))
+                grvt_pnl_usdc = (self.position.grvt_entry_price - grvt_price) * self.position.grvt_quantity
+                lighter_pnl_usdc = (lighter_price - self.position.lighter_entry_price) * self.position.lighter_quantity
             else:
                 # GRVT LONG + Lighter SHORT
-                grvt_pnl_pct = ((grvt_price - self.position.grvt_entry_price) /
-                                   self.position.grvt_entry_price * Decimal('100'))
-                lighter_pnl_pct = ((self.position.lighter_entry_price - lighter_price) /
-                                   self.position.lighter_entry_price * Decimal('100'))
+                grvt_pnl_usdc = (grvt_price - self.position.grvt_entry_price) * self.position.grvt_quantity
+                lighter_pnl_usdc = (self.position.lighter_entry_price - lighter_price) * self.position.lighter_quantity
 
-            self.logger.log(f"P&L: GRVT={grvt_pnl_pct:.2f}%, Lighter={lighter_pnl_pct:.2f}%", "INFO")
+            # Calculate total P&L
+            total_pnl_usdc = grvt_pnl_usdc + lighter_pnl_usdc
 
-            # Check stop loss for either exchange
-            stop_loss_threshold = -self.config.stop_loss
-            if grvt_pnl_pct <= stop_loss_threshold:
-                return True, f"GRVT Stop Loss triggered ({grvt_pnl_pct:.2f}%)"
+            # Calculate percentage P&L for logging
+            grvt_pnl_pct = (grvt_pnl_usdc / (self.position.grvt_entry_price * self.position.grvt_quantity)) * Decimal('100')
+            lighter_pnl_pct = (lighter_pnl_usdc / (self.position.lighter_entry_price * self.position.lighter_quantity)) * Decimal('100')
 
-            if lighter_pnl_pct <= stop_loss_threshold:
-                return True, f"Lighter Stop Loss triggered ({lighter_pnl_pct:.2f}%)"
+            self.logger.log(
+                f"P&L: GRVT={grvt_pnl_pct:.2f}% ({grvt_pnl_usdc:+.2f} USDC), "
+                f"Lighter={lighter_pnl_pct:.2f}% ({lighter_pnl_usdc:+.2f} USDC), "
+                f"Total={total_pnl_usdc:+.2f} USDC",
+                "INFO"
+            )
 
-            # Check take profit for either exchange
-            if grvt_pnl_pct >= self.config.take_profit:
-                return True, f"GRVT Take Profit triggered ({grvt_pnl_pct:.2f}%)"
+            # Check stop loss (total P&L in USDC)
+            if total_pnl_usdc <= -self.config.max_loss_usdc:
+                return True, f"Stop Loss triggered: {total_pnl_usdc:.2f} USDC (threshold: -{self.config.max_loss_usdc} USDC)"
 
-            if lighter_pnl_pct >= self.config.take_profit:
-                return True, f"Lighter Take Profit triggered ({lighter_pnl_pct:.2f}%)"
+            # Check take profit (total P&L in USDC)
+            if total_pnl_usdc >= self.config.max_profit_usdc:
+                return True, f"Take Profit triggered: {total_pnl_usdc:.2f} USDC (threshold: +{self.config.max_profit_usdc} USDC)"
 
             return False, ""
 
@@ -464,13 +467,14 @@ class GrvtLighterHedgeBot:
             return False, ""
 
     async def _close_hedge_positions(self):
-        """Close hedged positions - GRVT uses POST_ONLY limit order, Lighter uses market order.
+        """Close hedged positions - GRVT uses POST_ONLY limit order with dynamic price adjustment.
 
         Strategy:
-        1. Place POST_ONLY limit close order on GRVT (maker, low fees, NO market fallback)
-        2. Wait for GRVT close order to fill (60s timeout)
-        3. Once GRVT filled, immediately close Lighter position with market order (taker)
-        4. If GRVT not filled, cancel and retry in next cycle
+        1. Place POST_ONLY limit close order on GRVT (maker, low fees)
+        2. Wait 3 seconds for fill
+        3. If not filled: cancel and retry with updated price (chase the market)
+        4. Once GRVT filled, immediately close Lighter position with market order
+        5. Maximum 20 retries before giving up
         """
         try:
             self.logger.log("=== Closing Cross-Exchange Hedge Positions ===", "INFO")
@@ -487,62 +491,89 @@ class GrvtLighterHedgeBot:
                 grvt_close_side = 'sell'  # Close LONG
                 lighter_close_side = 'buy'   # Close SHORT
 
-            # Get current prices for GRVT close order
-            grvt_bid, grvt_ask = await self.grvt_client.fetch_bbo_prices(self.config.contract_id)
-
-            # Calculate close price for POST_ONLY order
-            if grvt_close_side == 'sell':
-                # Selling: place slightly above best bid to ensure maker
-                close_price = grvt_bid + self.config.tick_size
-            else:
-                # Buying: place slightly below best ask to ensure maker
-                close_price = grvt_ask - self.config.tick_size
-
-            # Step 1: Place POST_ONLY close order on GRVT (maker)
-            self.logger.log(f"Placing GRVT {grvt_close_side.upper()} POST_ONLY close order @ {close_price}...", "INFO")
-            try:
-                grvt_close = await self.grvt_client.place_close_order(
-                    self.config.contract_id,
-                    self.position.grvt_quantity,
-                    close_price,
-                    grvt_close_side
-                )
-            except Exception as e:
-                self.logger.log(f"GRVT POST_ONLY close order failed: {e}", "ERROR")
-                self.logger.log("⚠️ Position remains open, will retry in next cycle", "WARNING")
-                return
-
-            if not grvt_close.success:
-                self.logger.log(f"GRVT close failed: {grvt_close.error_message}", "ERROR")
-                self.logger.log("⚠️ Position remains open, will retry in next cycle", "WARNING")
-                return
-
-            # Step 2: Wait for GRVT close order to fill (with timeout)
-            self.logger.log(f"Waiting for GRVT close order {grvt_close.order_id} to fill...", "INFO")
-            timeout = 60  # 60 seconds timeout
-            start_time = asyncio.get_event_loop().time()
+            # Dynamic retry loop for GRVT close order
+            max_retries = 20
+            retry_timeout = 3  # 3 seconds per attempt
+            grvt_close = None
             filled = False
 
-            while asyncio.get_event_loop().time() - start_time < timeout:
-                order_info = await self.grvt_client.get_order_info(order_id=grvt_close.order_id)
+            for attempt in range(1, max_retries + 1):
+                # Get fresh BBO prices for each attempt
+                grvt_bid, grvt_ask = await self.grvt_client.fetch_bbo_prices(self.config.contract_id)
 
-                if order_info and order_info.status == 'FILLED' and order_info.filled_size > 0:
-                    filled = True
-                    grvt_close.filled_size = order_info.filled_size
-                    grvt_close.price = order_info.price
-                    self.logger.log(f"✓ GRVT closed (POST_ONLY): {order_info.filled_size} @ {order_info.price}", "INFO")
+                # Calculate close price for POST_ONLY order (dynamic price adjustment)
+                if grvt_close_side == 'sell':
+                    # Selling: place slightly above best bid to ensure maker
+                    close_price = grvt_bid + self.config.tick_size
+                else:
+                    # Buying: place slightly below best ask to ensure maker
+                    close_price = grvt_ask - self.config.tick_size
+
+                # Place POST_ONLY close order on GRVT
+                self.logger.log(
+                    f"Attempt {attempt}/{max_retries}: Placing GRVT {grvt_close_side.upper()} "
+                    f"POST_ONLY @ {close_price} (bid={grvt_bid}, ask={grvt_ask})...",
+                    "INFO"
+                )
+
+                try:
+                    grvt_close = await self.grvt_client.place_close_order(
+                        self.config.contract_id,
+                        self.position.grvt_quantity,
+                        close_price,
+                        grvt_close_side
+                    )
+                except Exception as e:
+                    self.logger.log(f"GRVT close order placement failed: {e}", "ERROR")
+                    await asyncio.sleep(0.5)
+                    continue
+
+                if not grvt_close.success:
+                    self.logger.log(f"GRVT close order rejected: {grvt_close.error_message}", "WARNING")
+                    await asyncio.sleep(0.5)
+                    continue
+
+                # Wait for order to fill (3 seconds timeout)
+                start_time = asyncio.get_event_loop().time()
+
+                while asyncio.get_event_loop().time() - start_time < retry_timeout:
+                    order_info = await self.grvt_client.get_order_info(order_id=grvt_close.order_id)
+
+                    if order_info and order_info.status == 'FILLED' and order_info.filled_size > 0:
+                        filled = True
+                        grvt_close.filled_size = order_info.filled_size
+                        grvt_close.price = order_info.price
+                        self.logger.log(
+                            f"✓ GRVT closed (POST_ONLY) on attempt {attempt}: "
+                            f"{order_info.filled_size} @ {order_info.price}",
+                            "INFO"
+                        )
+                        break
+
+                    await asyncio.sleep(0.2)  # Check every 200ms
+
+                if filled:
                     break
 
-                await asyncio.sleep(0.5)
+                # Not filled within 3 seconds - cancel and retry
+                self.logger.log(
+                    f"Order not filled within {retry_timeout}s, canceling and retrying...",
+                    "INFO"
+                )
+                try:
+                    await self.grvt_client.cancel_order(grvt_close.order_id)
+                except Exception as e:
+                    self.logger.log(f"Error canceling order: {e}", "WARNING")
 
+            # Check if GRVT close succeeded
             if not filled:
-                # Timeout - cancel order and keep position open for retry (NO market order fallback)
-                self.logger.log(f"⚠️ GRVT close order not filled within {timeout}s, canceling order...", "WARNING")
-                await self.grvt_client.cancel_order(grvt_close.order_id)
-                self.logger.log("⚠️ Position remains open, will retry in next cycle", "WARNING")
+                self.logger.log(
+                    f"⚠️ GRVT close failed after {max_retries} attempts, position remains open",
+                    "ERROR"
+                )
                 return
 
-            # Step 3: Immediately close Lighter position with market order (taker, fast execution)
+            # Step 2: Immediately close Lighter position with market order
             self.logger.log(f"Placing Lighter {lighter_close_side.upper()} market close order...", "INFO")
             try:
                 lighter_close = await self.lighter_client.place_market_order(
