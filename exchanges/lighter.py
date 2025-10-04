@@ -417,12 +417,20 @@ class LighterClient(BaseExchangeClient):
         if order_status != 'FILLED':
             self.logger.log(f"[MARKET] Warning: Order not filled after 5 seconds, status={order_status}", "WARNING")
 
+        # Use actual fill price if available, otherwise use order price
+        actual_price = self.current_order.price if (self.current_order and self.current_order.price) else price
+
+        self.logger.log(
+            f"[MARKET] Order completed: aggressive_price={price}, actual_fill_price={actual_price}",
+            "INFO"
+        )
+
         return OrderResult(
             success=True,
             order_id=self.current_order.order_id if self.current_order else order_result.order_id,
             side=side,
             size=quantity,
-            price=price,
+            price=actual_price,  # Return actual fill price, not order price
             status=order_status,
             filled_size=self.current_order.filled_size if self.current_order else Decimal(0)
         )

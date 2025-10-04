@@ -244,7 +244,7 @@ class GrvtLighterHedgeBot:
             self.logger.log(mode_desc, "INFO")
 
             # Dynamic retry loop for GRVT open order (infinite retries until filled)
-            retry_timeout = 3  # 3 seconds per attempt
+            retry_timeout = 10  # 10 seconds per attempt
             grvt_result = None
             filled = False
             attempt = 0
@@ -320,7 +320,7 @@ class GrvtLighterHedgeBot:
                 if filled:
                     break
 
-                # Not filled within 3 seconds - cancel and retry
+                # Not filled within timeout - cancel and retry
                 self.logger.log(
                     f"Order not filled within {retry_timeout}s, canceling and retrying...",
                     "INFO"
@@ -507,25 +507,42 @@ class GrvtLighterHedgeBot:
             lighter_price = (Decimal(str(lighter_bid)) + Decimal(str(lighter_ask))) / Decimal('2')
 
             # Calculate absolute P&L in USDC based on direction
+            # NOTE: GRVT uses full margin (no leverage), Lighter uses ~35x leverage
+
+            # GRVT P&L (no leverage, uses full notional value)
             if self.config.reverse:
-                # GRVT SHORT + Lighter LONG
                 grvt_pnl_usdc = (self.position.grvt_entry_price - grvt_price) * self.position.grvt_quantity
-                lighter_pnl_usdc = (lighter_price - self.position.lighter_entry_price) * self.position.lighter_quantity
             else:
-                # GRVT LONG + Lighter SHORT
                 grvt_pnl_usdc = (grvt_price - self.position.grvt_entry_price) * self.position.grvt_quantity
-                lighter_pnl_usdc = (self.position.lighter_entry_price - lighter_price) * self.position.lighter_quantity
+
+            # Lighter P&L (with leverage, need to calculate based on actual margin)
+            # Lighter default leverage is ~35x, so actual margin = notional / 35
+            lighter_leverage = Decimal('35')
+            lighter_notional = self.position.lighter_entry_price * self.position.lighter_quantity
+            lighter_actual_margin = lighter_notional / lighter_leverage
+
+            # Calculate Lighter price change percentage
+            if self.config.reverse:
+                # Lighter LONG
+                lighter_pnl_pct = (lighter_price - self.position.lighter_entry_price) / self.position.lighter_entry_price
+            else:
+                # Lighter SHORT
+                lighter_pnl_pct = (self.position.lighter_entry_price - lighter_price) / self.position.lighter_entry_price
+
+            # Lighter P&L in USDC = actual margin * price change percentage
+            lighter_pnl_usdc = lighter_actual_margin * lighter_pnl_pct
 
             # Calculate total P&L
             total_pnl_usdc = grvt_pnl_usdc + lighter_pnl_usdc
 
             # Calculate percentage P&L for logging
             grvt_pnl_pct = (grvt_pnl_usdc / (self.position.grvt_entry_price * self.position.grvt_quantity)) * Decimal('100')
-            lighter_pnl_pct = (lighter_pnl_usdc / (self.position.lighter_entry_price * self.position.lighter_quantity)) * Decimal('100')
+            # For Lighter, calculate percentage based on actual margin used (with leverage)
+            lighter_display_pnl_pct = (lighter_pnl_usdc / lighter_actual_margin) * Decimal('100')
 
             self.logger.log(
                 f"P&L: GRVT={grvt_pnl_pct:.2f}% ({grvt_pnl_usdc:+.2f} USDC), "
-                f"Lighter={lighter_pnl_pct:.2f}% ({lighter_pnl_usdc:+.2f} USDC), "
+                f"Lighter={lighter_display_pnl_pct:.2f}% ({lighter_pnl_usdc:+.2f} USDC, margin={lighter_actual_margin:.2f}), "
                 f"Total={total_pnl_usdc:+.2f} USDC",
                 "INFO"
             )
