@@ -22,8 +22,10 @@ class CrossHedgeConfig:
     ticker: str
     margin: Decimal  # Margin per trade in USDC
     hold_time: int  # Position hold time in seconds
-    take_profit: Decimal  # Take profit percentage (default 50%)
-    stop_loss: Decimal  # Stop loss percentage (default 50%)
+    take_profit: Decimal  # Take profit percentage (default 50%, deprecated - use max_profit_usdc)
+    stop_loss: Decimal  # Stop loss percentage (default 50%, deprecated - use max_loss_usdc)
+    max_loss_usdc: Decimal = Decimal('50')  # Maximum loss in USDC before stop loss
+    max_profit_usdc: Decimal = Decimal('100')  # Maximum profit in USDC for take profit (optional)
     reverse: bool = False  # Reverse direction (Paradex SHORT + Lighter LONG)
     cycle_wait: int = 20  # Wait time between trading cycles in seconds
     contract_id: str = ''
@@ -41,6 +43,7 @@ class CrossPositionState:
     lighter_quantity: Optional[Decimal] = None
     entry_time: Optional[float] = None
     is_open: bool = False
+    emergency_close: bool = False  # Flag for emergency market order close (stop loss/take profit)
 
 
 class CrossExchangeHedgeBot:
@@ -310,12 +313,13 @@ class CrossExchangeHedgeBot:
         return avg_mid
 
     async def _open_hedge_positions(self) -> bool:
-        """Open hedged positions - Paradex uses maker limit order, Lighter uses market order.
+        """Open hedged positions - Paradex uses dynamic retry limit order, Lighter uses market order.
 
         Strategy:
-        1. Place POST_ONLY limit order on Paradex (maker, low fees)
-        2. Wait for Paradex order to fill
-        3. Once filled, immediately hedge with Lighter market order (taker)
+        1. Place POST_ONLY limit order on Paradex (maker, low fees) with dynamic price tracking
+        2. Wait 3 seconds for fill, if not filled: cancel and retry with updated price
+        3. Infinite retries until filled (ensures opening position eventually)
+        4. Once Paradex filled, immediately hedge with Lighter market order (taker)
 
         Returns:
             True if both positions opened successfully, False otherwise
@@ -335,78 +339,98 @@ class CrossExchangeHedgeBot:
 
             self.logger.log(mode_desc, "INFO")
 
-            # ========== FIX: Use Paradex's actual order price for quantity calculation ==========
-            # Get Paradex's BBO prices
-            paradex_bid, paradex_ask = await self.paradex_client.fetch_bbo_prices(self.config.contract_id)
-
-            # Calculate Paradex's actual order price (same logic as paradex.py:get_order_price)
-            if paradex_side == 'buy':
-                # For buy orders, place slightly below best ask to ensure maker
-                paradex_order_price = paradex_ask - self.config.tick_size
-            else:
-                # For sell orders, place slightly above best bid to ensure maker
-                paradex_order_price = paradex_bid + self.config.tick_size
-
-            # Round to tick size
-            paradex_order_price = self.paradex_client.round_to_tick(paradex_order_price)
-
-            # Validate price
-            if paradex_order_price <= 0:
-                self.logger.log(f"Invalid Paradex order price: {paradex_order_price}", "ERROR")
-                return False
-
-            # Calculate quantity based on Paradex's actual order price (not average)
-            quantity = await self._calculate_quantity_from_margin(paradex_order_price, paradex_side)
-
-            # Get average price for monitoring/logging only
-            avg_price = await self._get_average_price()
-
-            self.logger.log(
-                f"Paradex {paradex_side.upper()} target: {quantity} @ {paradex_order_price} "
-                f"(bid={paradex_bid}, ask={paradex_ask}, avg_price={avg_price})",
-                "INFO"
-            )
-            # ========== END FIX ==========
-
-            # Step 1: Place POST_ONLY limit order on Paradex (maker)
-            self.logger.log(f"Placing Paradex {paradex_side.upper()} maker order...", "INFO")
-            try:
-                paradex_result = await self.paradex_client.place_open_order(
-                    self.config.contract_id, quantity, paradex_side
-                )
-            except Exception as e:
-                self.logger.log(f"Paradex order placement failed: {e}", "ERROR")
-                return False
-
-            if not paradex_result.success:
-                self.logger.log(f"Paradex order failed: {paradex_result.error_message}", "ERROR")
-                return False
-
-            # Step 2: Wait for Paradex order to fill (with timeout)
-            self.logger.log(f"Waiting for Paradex order {paradex_result.order_id} to fill...", "INFO")
-            timeout = 60  # 60 seconds timeout
-            start_time = asyncio.get_event_loop().time()
+            # Dynamic retry loop for Paradex open order (infinite retries until filled)
+            retry_timeout = 3  # 3 seconds per attempt
+            paradex_result = None
             filled = False
+            attempt = 0
 
-            while asyncio.get_event_loop().time() - start_time < timeout:
-                order_info = await self.paradex_client.get_order_info(paradex_result.order_id)
+            while not filled and not self.shutdown_requested:
+                attempt += 1
 
-                if order_info and order_info.status == 'CLOSED' and order_info.filled_size > 0:
-                    filled = True
-                    paradex_result.filled_size = order_info.filled_size
-                    paradex_result.price = order_info.price
-                    self.logger.log(f"✓ Paradex order filled: {order_info.filled_size} @ {order_info.price}", "INFO")
+                # Get fresh BBO prices for each attempt
+                paradex_bid, paradex_ask = await self.paradex_client.fetch_bbo_prices(self.config.contract_id)
+
+                # Calculate Paradex's actual order price (same logic as paradex.py:get_order_price)
+                if paradex_side == 'buy':
+                    # For buy orders, place slightly below best ask to ensure maker
+                    paradex_order_price = paradex_ask - self.config.tick_size
+                else:
+                    # For sell orders, place slightly above best bid to ensure maker
+                    paradex_order_price = paradex_bid + self.config.tick_size
+
+                # Round to tick size
+                paradex_order_price = self.paradex_client.round_to_tick(paradex_order_price)
+
+                # Validate price
+                if paradex_order_price <= 0:
+                    self.logger.log(f"Invalid Paradex order price: {paradex_order_price}, retrying...", "WARNING")
+                    await asyncio.sleep(0.5)
+                    continue
+
+                # Calculate quantity based on Paradex's actual order price (recalculate each time for accuracy)
+                quantity = await self._calculate_quantity_from_margin(paradex_order_price, paradex_side)
+
+                # Log attempt
+                self.logger.log(
+                    f"Attempt {attempt}: Placing Paradex {paradex_side.upper()} POST_ONLY @ {paradex_order_price} "
+                    f"(bid={paradex_bid}, ask={paradex_ask}, qty={quantity})",
+                    "INFO"
+                )
+
+                # Place POST_ONLY limit order on Paradex
+                try:
+                    paradex_result = await self.paradex_client.place_open_order(
+                        self.config.contract_id, quantity, paradex_side
+                    )
+                except Exception as e:
+                    self.logger.log(f"Paradex order placement failed: {e}, retrying...", "ERROR")
+                    await asyncio.sleep(0.5)
+                    continue
+
+                if not paradex_result.success:
+                    self.logger.log(f"Paradex order rejected: {paradex_result.error_message}, retrying...", "WARNING")
+                    await asyncio.sleep(0.5)
+                    continue
+
+                # Wait for order to fill (3 seconds timeout)
+                start_time = asyncio.get_event_loop().time()
+
+                while asyncio.get_event_loop().time() - start_time < retry_timeout:
+                    order_info = await self.paradex_client.get_order_info(paradex_result.order_id)
+
+                    if order_info and order_info.status == 'CLOSED' and order_info.filled_size > 0:
+                        filled = True
+                        paradex_result.filled_size = order_info.filled_size
+                        paradex_result.price = order_info.price
+                        self.logger.log(
+                            f"✓ Paradex open order filled on attempt {attempt}: "
+                            f"{order_info.filled_size} @ {order_info.price}",
+                            "INFO"
+                        )
+                        break
+
+                    await asyncio.sleep(0.2)  # Check every 200ms
+
+                if filled:
                     break
 
-                await asyncio.sleep(0.5)
+                # Not filled within 3 seconds - cancel and retry
+                self.logger.log(
+                    f"Order not filled within {retry_timeout}s, canceling and retrying...",
+                    "INFO"
+                )
+                try:
+                    await self.paradex_client.cancel_order(paradex_result.order_id)
+                except Exception as e:
+                    self.logger.log(f"Error canceling order: {e}", "WARNING")
 
-            if not filled:
-                # Timeout - cancel Paradex order
-                self.logger.log(f"Paradex order not filled within {timeout}s, cancelling...", "WARNING")
-                await self.paradex_client.cancel_order(paradex_result.order_id)
+            # Check if we were interrupted
+            if self.shutdown_requested:
+                self.logger.log("Opening positions interrupted by shutdown request", "WARNING")
                 return False
 
-            # Step 3: Immediately place Lighter market order to hedge
+            # Step 2: Immediately place Lighter market order to hedge
             self.logger.log(f"Placing Lighter {lighter_side.upper()} market order to hedge...", "INFO")
             try:
                 lighter_result = await self.lighter_client.place_market_order(
@@ -504,8 +528,64 @@ class CrossExchangeHedgeBot:
             self.logger.log(f"Error during Paradex rollback: {e}", "ERROR")
             await self.send_notification(f"⚠️ CRITICAL: Paradex rollback failed: {e}")
 
+    async def _emergency_market_close(self, paradex_close_side: str, lighter_close_side: str):
+        """Emergency close using market orders on both exchanges (for stop loss/take profit).
+
+        Args:
+            paradex_close_side: Paradex close side ('buy' or 'sell')
+            lighter_close_side: Lighter close side ('buy' or 'sell')
+        """
+        try:
+            self.logger.log("⚡ Executing EMERGENCY MARKET CLOSE on both exchanges", "WARNING")
+
+            # Close both positions simultaneously with market orders
+            paradex_task = self.paradex_client.place_market_order(
+                self.config.contract_id,
+                self.position.paradex_quantity,
+                paradex_close_side
+            )
+
+            lighter_task = self.lighter_client.place_market_order(
+                self.lighter_client.config.contract_id,
+                self.position.lighter_quantity,
+                lighter_close_side
+            )
+
+            # Execute both market orders in parallel
+            paradex_result, lighter_result = await asyncio.gather(paradex_task, lighter_task, return_exceptions=True)
+
+            # Check Paradex result
+            if isinstance(paradex_result, Exception):
+                self.logger.log(f"❌ Paradex market close failed: {paradex_result}", "ERROR")
+                await self.send_notification(f"🚨 CRITICAL: Paradex emergency close failed: {paradex_result}")
+            elif paradex_result.success and paradex_result.status == 'FILLED':
+                self.logger.log(f"✓ Paradex closed (market): {paradex_result.filled_size} @ {paradex_result.price}", "INFO")
+            else:
+                self.logger.log(f"❌ Paradex market close unsuccessful: status={paradex_result.status}", "ERROR")
+                await self.send_notification(f"🚨 CRITICAL: Paradex emergency close status: {paradex_result.status}")
+
+            # Check Lighter result
+            if isinstance(lighter_result, Exception):
+                self.logger.log(f"❌ Lighter market close failed: {lighter_result}", "ERROR")
+                await self.send_notification(f"🚨 CRITICAL: Lighter emergency close failed: {lighter_result}")
+            elif lighter_result.success and lighter_result.status == 'FILLED':
+                self.logger.log(f"✓ Lighter closed (market): {lighter_result.filled_size} @ {lighter_result.price}", "INFO")
+            else:
+                self.logger.log(f"❌ Lighter market close unsuccessful: status={lighter_result.status}", "ERROR")
+                await self.send_notification(f"🚨 CRITICAL: Lighter emergency close status: {lighter_result.status}")
+
+            # Reset position state
+            self.position = CrossPositionState()
+
+            self.logger.log("=== EMERGENCY CLOSE COMPLETED ===", "INFO")
+
+        except Exception as e:
+            self.logger.log(f"❌ Critical error during emergency close: {e}", "ERROR")
+            self.logger.log(f"Traceback: {traceback.format_exc()}", "ERROR")
+            await self.send_notification(f"🚨 CRITICAL: Emergency close exception: {e}")
+
     async def _check_stop_conditions(self) -> Tuple[bool, str]:
-        """Check if stop-loss or take-profit conditions are met.
+        """Check if stop-loss or take-profit conditions are met (using absolute USDC values).
 
         Returns:
             Tuple of (should_close, reason)
@@ -521,36 +601,37 @@ class CrossExchangeHedgeBot:
             lighter_bid, lighter_ask = await self.lighter_client.fetch_bbo_prices(self.lighter_client.config.contract_id)
             lighter_price = (Decimal(str(lighter_bid)) + Decimal(str(lighter_ask))) / Decimal('2')
 
-            # Calculate P&L based on direction
+            # Calculate absolute P&L in USDC based on direction
             if self.config.reverse:
                 # Paradex SHORT + Lighter LONG
-                paradex_pnl_pct = ((self.position.paradex_entry_price - paradex_price) /
-                                   self.position.paradex_entry_price * Decimal('100'))
-                lighter_pnl_pct = ((lighter_price - self.position.lighter_entry_price) /
-                                   self.position.lighter_entry_price * Decimal('100'))
+                paradex_pnl_usdc = (self.position.paradex_entry_price - paradex_price) * self.position.paradex_quantity
+                lighter_pnl_usdc = (lighter_price - self.position.lighter_entry_price) * self.position.lighter_quantity
             else:
                 # Paradex LONG + Lighter SHORT
-                paradex_pnl_pct = ((paradex_price - self.position.paradex_entry_price) /
-                                   self.position.paradex_entry_price * Decimal('100'))
-                lighter_pnl_pct = ((self.position.lighter_entry_price - lighter_price) /
-                                   self.position.lighter_entry_price * Decimal('100'))
+                paradex_pnl_usdc = (paradex_price - self.position.paradex_entry_price) * self.position.paradex_quantity
+                lighter_pnl_usdc = (self.position.lighter_entry_price - lighter_price) * self.position.lighter_quantity
 
-            self.logger.log(f"P&L: Paradex={paradex_pnl_pct:.2f}%, Lighter={lighter_pnl_pct:.2f}%", "INFO")
+            # Calculate total P&L
+            total_pnl_usdc = paradex_pnl_usdc + lighter_pnl_usdc
 
-            # Check stop loss for either exchange
-            stop_loss_threshold = -self.config.stop_loss
-            if paradex_pnl_pct <= stop_loss_threshold:
-                return True, f"Paradex Stop Loss triggered ({paradex_pnl_pct:.2f}%)"
+            # Calculate percentage P&L for logging
+            paradex_pnl_pct = (paradex_pnl_usdc / (self.position.paradex_entry_price * self.position.paradex_quantity)) * Decimal('100')
+            lighter_pnl_pct = (lighter_pnl_usdc / (self.position.lighter_entry_price * self.position.lighter_quantity)) * Decimal('100')
 
-            if lighter_pnl_pct <= stop_loss_threshold:
-                return True, f"Lighter Stop Loss triggered ({lighter_pnl_pct:.2f}%)"
+            self.logger.log(
+                f"P&L: Paradex={paradex_pnl_pct:.2f}% ({paradex_pnl_usdc:+.2f} USDC), "
+                f"Lighter={lighter_pnl_pct:.2f}% ({lighter_pnl_usdc:+.2f} USDC), "
+                f"Total={total_pnl_usdc:+.2f} USDC",
+                "INFO"
+            )
 
-            # Check take profit for either exchange
-            if paradex_pnl_pct >= self.config.take_profit:
-                return True, f"Paradex Take Profit triggered ({paradex_pnl_pct:.2f}%)"
+            # Check stop loss (total P&L in USDC)
+            if total_pnl_usdc <= -self.config.max_loss_usdc:
+                return True, f"Stop Loss triggered: {total_pnl_usdc:.2f} USDC (threshold: -{self.config.max_loss_usdc} USDC)"
 
-            if lighter_pnl_pct >= self.config.take_profit:
-                return True, f"Lighter Take Profit triggered ({lighter_pnl_pct:.2f}%)"
+            # Check take profit (total P&L in USDC)
+            if total_pnl_usdc >= self.config.max_profit_usdc:
+                return True, f"Take Profit triggered: {total_pnl_usdc:.2f} USDC (threshold: +{self.config.max_profit_usdc} USDC)"
 
             return False, ""
 
@@ -559,13 +640,11 @@ class CrossExchangeHedgeBot:
             return False, ""
 
     async def _close_hedge_positions(self):
-        """Close hedged positions - Paradex uses POST_ONLY limit order, Lighter uses market order.
+        """Close hedged positions - uses market orders for emergency close (stop loss/take profit).
 
         Strategy:
-        1. Place POST_ONLY limit close order on Paradex (maker, low fees, NO market fallback)
-        2. Wait for Paradex close order to fill (60s timeout)
-        3. Once Paradex filled, immediately close Lighter position with market order (taker)
-        4. If Paradex not filled, cancel and retry in next cycle
+        - Normal close (hold time expired): POST_ONLY limit order with 30 retries + market fallback
+        - Emergency close (stop loss/take profit): Market orders for immediate execution
         """
         try:
             self.logger.log("=== Closing Cross-Exchange Hedge Positions ===", "INFO")
@@ -582,62 +661,104 @@ class CrossExchangeHedgeBot:
                 paradex_close_side = 'sell'  # Close LONG
                 lighter_close_side = 'buy'   # Close SHORT
 
-            # Get current prices for Paradex close order
-            paradex_bid, paradex_ask = await self.paradex_client.fetch_bbo_prices(self.config.contract_id)
-
-            # Calculate close price for POST_ONLY order
-            if paradex_close_side == 'sell':
-                # Selling: place slightly above best bid to ensure maker
-                close_price = paradex_bid + self.config.tick_size
-            else:
-                # Buying: place slightly below best ask to ensure maker
-                close_price = paradex_ask - self.config.tick_size
-
-            # Step 1: Place POST_ONLY close order on Paradex (maker)
-            self.logger.log(f"Placing Paradex {paradex_close_side.upper()} POST_ONLY close order @ {close_price}...", "INFO")
-            try:
-                paradex_close = await self.paradex_client.place_close_order(
-                    self.config.contract_id,
-                    self.position.paradex_quantity,
-                    close_price,
-                    paradex_close_side
-                )
-            except Exception as e:
-                self.logger.log(f"Paradex POST_ONLY close order failed: {e}", "ERROR")
-                self.logger.log("⚠️ Position remains open, will retry in next cycle", "WARNING")
+            # Check if emergency close (stop loss/take profit triggered)
+            if self.position.emergency_close:
+                self.logger.log("🚨 EMERGENCY CLOSE: Using market orders for immediate execution", "WARNING")
+                await self._emergency_market_close(paradex_close_side, lighter_close_side)
                 return
 
-            if not paradex_close.success:
-                self.logger.log(f"Paradex close failed: {paradex_close.error_message}", "ERROR")
-                self.logger.log("⚠️ Position remains open, will retry in next cycle", "WARNING")
-                return
-
-            # Step 2: Wait for Paradex close order to fill (with timeout)
-            self.logger.log(f"Waiting for Paradex close order {paradex_close.order_id} to fill...", "INFO")
-            timeout = 60  # 60 seconds timeout
-            start_time = asyncio.get_event_loop().time()
+            # Dynamic retry loop for Paradex close order
+            max_retries = 30  # Increased to 30 retries before fallback to market order
+            retry_timeout = 3  # 3 seconds per attempt
+            paradex_close = None
             filled = False
 
-            while asyncio.get_event_loop().time() - start_time < timeout:
-                order_info = await self.paradex_client.get_order_info(paradex_close.order_id)
+            for attempt in range(1, max_retries + 1):
+                # Get fresh BBO prices for each attempt
+                paradex_bid, paradex_ask = await self.paradex_client.fetch_bbo_prices(self.config.contract_id)
 
-                if order_info and order_info.status == 'CLOSED' and order_info.filled_size > 0:
-                    filled = True
-                    paradex_close.filled_size = order_info.filled_size
-                    paradex_close.price = order_info.price
-                    self.logger.log(f"✓ Paradex closed (POST_ONLY): {order_info.filled_size} @ {order_info.price}", "INFO")
+                # Calculate close price for POST_ONLY order (dynamic price adjustment)
+                if paradex_close_side == 'sell':
+                    # Selling: place slightly above best bid to ensure maker
+                    close_price = paradex_bid + self.config.tick_size
+                else:
+                    # Buying: place slightly below best ask to ensure maker
+                    close_price = paradex_ask - self.config.tick_size
+
+                # Place POST_ONLY close order on Paradex
+                self.logger.log(
+                    f"Attempt {attempt}/{max_retries}: Placing Paradex {paradex_close_side.upper()} "
+                    f"POST_ONLY @ {close_price} (bid={paradex_bid}, ask={paradex_ask})...",
+                    "INFO"
+                )
+
+                try:
+                    paradex_close = await self.paradex_client.place_close_order(
+                        self.config.contract_id,
+                        self.position.paradex_quantity,
+                        close_price,
+                        paradex_close_side
+                    )
+                except Exception as e:
+                    self.logger.log(f"Paradex close order placement failed: {e}", "ERROR")
+                    await asyncio.sleep(0.5)
+                    continue
+
+                if not paradex_close.success:
+                    self.logger.log(f"Paradex close order rejected: {paradex_close.error_message}", "WARNING")
+                    await asyncio.sleep(0.5)
+                    continue
+
+                # Wait for order to fill (3 seconds timeout)
+                start_time = asyncio.get_event_loop().time()
+
+                while asyncio.get_event_loop().time() - start_time < retry_timeout:
+                    order_info = await self.paradex_client.get_order_info(order_id=paradex_close.order_id)
+
+                    if order_info and order_info.status == 'CLOSED' and order_info.filled_size > 0:
+                        filled = True
+                        paradex_close.filled_size = order_info.filled_size
+                        paradex_close.price = order_info.price
+                        self.logger.log(
+                            f"✓ Paradex closed (POST_ONLY) on attempt {attempt}: "
+                            f"{order_info.filled_size} @ {order_info.price}",
+                            "INFO"
+                        )
+                        break
+
+                    await asyncio.sleep(0.2)  # Check every 200ms
+
+                if filled:
                     break
 
-                await asyncio.sleep(0.5)
+                # Not filled within 3 seconds - cancel and retry
+                self.logger.log(
+                    f"Order not filled within {retry_timeout}s, canceling and retrying...",
+                    "INFO"
+                )
+                try:
+                    await self.paradex_client.cancel_order(paradex_close.order_id)
+                except Exception as e:
+                    self.logger.log(f"Error canceling order: {e}", "WARNING")
 
+            # Check if Paradex close succeeded
             if not filled:
-                # Timeout - cancel order and keep position open for retry (NO market order fallback)
-                self.logger.log(f"⚠️ Paradex close order not filled within {timeout}s, canceling order...", "WARNING")
-                await self.paradex_client.cancel_order(paradex_close.order_id)
-                self.logger.log("⚠️ Position remains open, will retry in next cycle", "WARNING")
+                # Fallback to emergency market order after max retries
+                self.logger.log(
+                    f"⚠️ POST_ONLY limit order failed after {max_retries} attempts ({max_retries * retry_timeout}s)",
+                    "ERROR"
+                )
+                self.logger.log("🚨 FALLBACK: Executing emergency market order to close position", "WARNING")
+                await self.send_notification(
+                    f"⚠️ Paradex limit order failed after {max_retries} attempts, "
+                    f"falling back to market order"
+                )
+
+                # Use emergency market close as fallback
+                await self._emergency_market_close(paradex_close_side, lighter_close_side)
                 return
 
-            # Step 3: Immediately close Lighter position with market order (taker, fast execution)
+            # Step 2: Immediately close Lighter position with market order
             self.logger.log(f"Placing Lighter {lighter_close_side.upper()} market close order...", "INFO")
             try:
                 lighter_close = await self.lighter_client.place_market_order(
@@ -722,6 +843,8 @@ class CrossExchangeHedgeBot:
                         should_close, reason = await self._check_stop_conditions()
                         if should_close:
                             self.logger.log(f"Stop condition met: {reason}", "INFO")
+                            # Set emergency close flag for market order execution
+                            self.position.emergency_close = True
                             break
 
                         # Sleep and check again

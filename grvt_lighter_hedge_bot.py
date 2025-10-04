@@ -43,6 +43,7 @@ class CrossPositionState:
     lighter_quantity: Optional[Decimal] = None
     entry_time: Optional[float] = None
     is_open: bool = False
+    emergency_close: bool = False  # Flag for emergency market order close (stop loss/take profit)
 
 
 class GrvtLighterHedgeBot:
@@ -216,12 +217,13 @@ class GrvtLighterHedgeBot:
         return avg_mid
 
     async def _open_hedge_positions(self) -> bool:
-        """Open hedged positions - GRVT uses maker limit order, Lighter uses market order.
+        """Open hedged positions - GRVT uses dynamic retry limit order, Lighter uses market order.
 
         Strategy:
-        1. Place POST_ONLY limit order on GRVT (maker, low fees)
-        2. Wait for GRVT order to fill
-        3. Once filled, immediately hedge with Lighter market order (taker)
+        1. Place POST_ONLY limit order on GRVT (maker, low fees) with dynamic price tracking
+        2. Wait 3 seconds for fill, if not filled: cancel and retry with updated price
+        3. Infinite retries until filled (ensures opening position eventually)
+        4. Once GRVT filled, immediately hedge with Lighter market order (taker)
 
         Returns:
             True if both positions opened successfully, False otherwise
@@ -241,79 +243,99 @@ class GrvtLighterHedgeBot:
 
             self.logger.log(mode_desc, "INFO")
 
-            # ========== FIX: Use GRVT's actual order price for quantity calculation ==========
-            # Get GRVT's BBO prices
-            grvt_bid, grvt_ask = await self.grvt_client.fetch_bbo_prices(self.config.contract_id)
-
-            # Calculate GRVT's actual order price (same logic as grvt.py:get_order_price)
-            if grvt_side == 'buy':
-                # For buy orders, place slightly below best ask to ensure maker
-                grvt_order_price = grvt_ask - self.config.tick_size
-            else:
-                # For sell orders, place slightly above best bid to ensure maker
-                grvt_order_price = grvt_bid + self.config.tick_size
-
-            # Round to tick size
-            grvt_order_price = self.grvt_client.round_to_tick(grvt_order_price)
-
-            # Validate price
-            if grvt_order_price <= 0:
-                self.logger.log(f"Invalid GRVT order price: {grvt_order_price}", "ERROR")
-                return False
-
-            # Calculate quantity based on GRVT's actual order price (not average)
-            quantity = await self._calculate_quantity_from_margin(grvt_order_price, grvt_side)
-
-            # Get average price for monitoring/logging only
-            avg_price = await self._get_average_price()
-
-            self.logger.log(
-                f"GRVT {grvt_side.upper()} target: {quantity} @ {grvt_order_price} "
-                f"(bid={grvt_bid}, ask={grvt_ask}, avg_price={avg_price})",
-                "INFO"
-            )
-            # ========== END FIX ==========
-
-            # Step 1: Place POST_ONLY limit order on GRVT (maker)
-            self.logger.log(f"Placing GRVT {grvt_side.upper()} maker order...", "INFO")
-            try:
-                grvt_result = await self.grvt_client.place_open_order(
-                    self.config.contract_id, quantity, grvt_side
-                )
-            except Exception as e:
-                self.logger.log(f"GRVT order placement failed: {e}", "ERROR")
-                return False
-
-            if not grvt_result.success:
-                self.logger.log(f"GRVT order failed: {grvt_result.error_message}", "ERROR")
-                return False
-
-            # Step 2: Wait for GRVT order to fill (with timeout)
-            self.logger.log(f"Waiting for GRVT order {grvt_result.order_id} to fill...", "INFO")
-            timeout = 60  # 60 seconds timeout
-            start_time = asyncio.get_event_loop().time()
+            # Dynamic retry loop for GRVT open order (infinite retries until filled)
+            retry_timeout = 3  # 3 seconds per attempt
+            grvt_result = None
             filled = False
+            attempt = 0
 
-            while asyncio.get_event_loop().time() - start_time < timeout:
-                order_info = await self.grvt_client.get_order_info(order_id=grvt_result.order_id)
+            while not filled and not self.shutdown_requested:
+                attempt += 1
 
-                # GRVT uses 'FILLED' status (not Paradex's 'CLOSED')
-                if order_info and order_info.status == 'FILLED' and order_info.filled_size > 0:
-                    filled = True
-                    grvt_result.filled_size = order_info.filled_size
-                    grvt_result.price = order_info.price
-                    self.logger.log(f"✓ GRVT order filled: {order_info.filled_size} @ {order_info.price}", "INFO")
+                # Get fresh BBO prices for each attempt
+                grvt_bid, grvt_ask = await self.grvt_client.fetch_bbo_prices(self.config.contract_id)
+
+                # Calculate GRVT's actual order price (same logic as grvt.py:get_order_price)
+                if grvt_side == 'buy':
+                    # For buy orders, place slightly below best ask to ensure maker
+                    grvt_order_price = grvt_ask - self.config.tick_size
+                else:
+                    # For sell orders, place slightly above best bid to ensure maker
+                    grvt_order_price = grvt_bid + self.config.tick_size
+
+                # Round to tick size
+                grvt_order_price = self.grvt_client.round_to_tick(grvt_order_price)
+
+                # Validate price
+                if grvt_order_price <= 0:
+                    self.logger.log(f"Invalid GRVT order price: {grvt_order_price}, retrying...", "WARNING")
+                    await asyncio.sleep(0.5)
+                    continue
+
+                # Calculate quantity based on GRVT's actual order price (recalculate each time for accuracy)
+                quantity = await self._calculate_quantity_from_margin(grvt_order_price, grvt_side)
+
+                # Log attempt
+                self.logger.log(
+                    f"Attempt {attempt}: Placing GRVT {grvt_side.upper()} POST_ONLY @ {grvt_order_price} "
+                    f"(bid={grvt_bid}, ask={grvt_ask}, qty={quantity})",
+                    "INFO"
+                )
+
+                # Place POST_ONLY limit order on GRVT
+                try:
+                    grvt_result = await self.grvt_client.place_open_order(
+                        self.config.contract_id, quantity, grvt_side
+                    )
+                except Exception as e:
+                    self.logger.log(f"GRVT order placement failed: {e}, retrying...", "ERROR")
+                    await asyncio.sleep(0.5)
+                    continue
+
+                if not grvt_result.success:
+                    self.logger.log(f"GRVT order rejected: {grvt_result.error_message}, retrying...", "WARNING")
+                    await asyncio.sleep(0.5)
+                    continue
+
+                # Wait for order to fill (3 seconds timeout)
+                start_time = asyncio.get_event_loop().time()
+
+                while asyncio.get_event_loop().time() - start_time < retry_timeout:
+                    order_info = await self.grvt_client.get_order_info(order_id=grvt_result.order_id)
+
+                    # GRVT uses 'FILLED' status (not Paradex's 'CLOSED')
+                    if order_info and order_info.status == 'FILLED' and order_info.filled_size > 0:
+                        filled = True
+                        grvt_result.filled_size = order_info.filled_size
+                        grvt_result.price = order_info.price
+                        self.logger.log(
+                            f"✓ GRVT open order filled on attempt {attempt}: "
+                            f"{order_info.filled_size} @ {order_info.price}",
+                            "INFO"
+                        )
+                        break
+
+                    await asyncio.sleep(0.2)  # Check every 200ms
+
+                if filled:
                     break
 
-                await asyncio.sleep(0.5)
+                # Not filled within 3 seconds - cancel and retry
+                self.logger.log(
+                    f"Order not filled within {retry_timeout}s, canceling and retrying...",
+                    "INFO"
+                )
+                try:
+                    await self.grvt_client.cancel_order(grvt_result.order_id)
+                except Exception as e:
+                    self.logger.log(f"Error canceling order: {e}", "WARNING")
 
-            if not filled:
-                # Timeout - cancel GRVT order
-                self.logger.log(f"GRVT order not filled within {timeout}s, cancelling...", "WARNING")
-                await self.grvt_client.cancel_order(grvt_result.order_id)
+            # Check if we were interrupted
+            if self.shutdown_requested:
+                self.logger.log("Opening positions interrupted by shutdown request", "WARNING")
                 return False
 
-            # Step 3: Immediately place Lighter market order to hedge
+            # Step 2: Immediately place Lighter market order to hedge
             self.logger.log(f"Placing Lighter {lighter_side.upper()} market order to hedge...", "INFO")
             try:
                 lighter_result = await self.lighter_client.place_market_order(
@@ -411,6 +433,62 @@ class GrvtLighterHedgeBot:
             self.logger.log(f"Error during GRVT rollback: {e}", "ERROR")
             await self.send_notification(f"⚠️ CRITICAL: GRVT rollback failed: {e}")
 
+    async def _emergency_market_close(self, grvt_close_side: str, lighter_close_side: str):
+        """Emergency close using market orders on both exchanges (for stop loss/take profit).
+
+        Args:
+            grvt_close_side: GRVT close side ('buy' or 'sell')
+            lighter_close_side: Lighter close side ('buy' or 'sell')
+        """
+        try:
+            self.logger.log("⚡ Executing EMERGENCY MARKET CLOSE on both exchanges", "WARNING")
+
+            # Close both positions simultaneously with market orders
+            grvt_task = self.grvt_client.place_market_order(
+                self.config.contract_id,
+                self.position.grvt_quantity,
+                grvt_close_side
+            )
+
+            lighter_task = self.lighter_client.place_market_order(
+                self.lighter_client.config.contract_id,
+                self.position.lighter_quantity,
+                lighter_close_side
+            )
+
+            # Execute both market orders in parallel
+            grvt_result, lighter_result = await asyncio.gather(grvt_task, lighter_task, return_exceptions=True)
+
+            # Check GRVT result
+            if isinstance(grvt_result, Exception):
+                self.logger.log(f"❌ GRVT market close failed: {grvt_result}", "ERROR")
+                await self.send_notification(f"🚨 CRITICAL: GRVT emergency close failed: {grvt_result}")
+            elif grvt_result.success and grvt_result.status == 'FILLED':
+                self.logger.log(f"✓ GRVT closed (market): {grvt_result.filled_size} @ {grvt_result.price}", "INFO")
+            else:
+                self.logger.log(f"❌ GRVT market close unsuccessful: status={grvt_result.status}", "ERROR")
+                await self.send_notification(f"🚨 CRITICAL: GRVT emergency close status: {grvt_result.status}")
+
+            # Check Lighter result
+            if isinstance(lighter_result, Exception):
+                self.logger.log(f"❌ Lighter market close failed: {lighter_result}", "ERROR")
+                await self.send_notification(f"🚨 CRITICAL: Lighter emergency close failed: {lighter_result}")
+            elif lighter_result.success and lighter_result.status == 'FILLED':
+                self.logger.log(f"✓ Lighter closed (market): {lighter_result.filled_size} @ {lighter_result.price}", "INFO")
+            else:
+                self.logger.log(f"❌ Lighter market close unsuccessful: status={lighter_result.status}", "ERROR")
+                await self.send_notification(f"🚨 CRITICAL: Lighter emergency close status: {lighter_result.status}")
+
+            # Reset position state
+            self.position = CrossPositionState()
+
+            self.logger.log("=== EMERGENCY CLOSE COMPLETED ===", "INFO")
+
+        except Exception as e:
+            self.logger.log(f"❌ Critical error during emergency close: {e}", "ERROR")
+            self.logger.log(f"Traceback: {traceback.format_exc()}", "ERROR")
+            await self.send_notification(f"🚨 CRITICAL: Emergency close exception: {e}")
+
     async def _check_stop_conditions(self) -> Tuple[bool, str]:
         """Check if stop-loss or take-profit conditions are met (using absolute USDC values).
 
@@ -467,14 +545,11 @@ class GrvtLighterHedgeBot:
             return False, ""
 
     async def _close_hedge_positions(self):
-        """Close hedged positions - GRVT uses POST_ONLY limit order with dynamic price adjustment.
+        """Close hedged positions - uses market orders for emergency close (stop loss/take profit).
 
         Strategy:
-        1. Place POST_ONLY limit close order on GRVT (maker, low fees)
-        2. Wait 3 seconds for fill
-        3. If not filled: cancel and retry with updated price (chase the market)
-        4. Once GRVT filled, immediately close Lighter position with market order
-        5. Maximum 20 retries before giving up
+        - Normal close (hold time expired): POST_ONLY limit order with retries
+        - Emergency close (stop loss/take profit): Market orders for immediate execution
         """
         try:
             self.logger.log("=== Closing Cross-Exchange Hedge Positions ===", "INFO")
@@ -491,8 +566,14 @@ class GrvtLighterHedgeBot:
                 grvt_close_side = 'sell'  # Close LONG
                 lighter_close_side = 'buy'   # Close SHORT
 
+            # Check if emergency close (stop loss/take profit triggered)
+            if self.position.emergency_close:
+                self.logger.log("🚨 EMERGENCY CLOSE: Using market orders for immediate execution", "WARNING")
+                await self._emergency_market_close(grvt_close_side, lighter_close_side)
+                return
+
             # Dynamic retry loop for GRVT close order
-            max_retries = 20
+            max_retries = 30  # Increased to 30 retries before fallback to market order
             retry_timeout = 3  # 3 seconds per attempt
             grvt_close = None
             filled = False
@@ -567,10 +648,19 @@ class GrvtLighterHedgeBot:
 
             # Check if GRVT close succeeded
             if not filled:
+                # Fallback to emergency market order after max retries
                 self.logger.log(
-                    f"⚠️ GRVT close failed after {max_retries} attempts, position remains open",
+                    f"⚠️ POST_ONLY limit order failed after {max_retries} attempts ({max_retries * retry_timeout}s)",
                     "ERROR"
                 )
+                self.logger.log("🚨 FALLBACK: Executing emergency market order to close position", "WARNING")
+                await self.send_notification(
+                    f"⚠️ GRVT limit order failed after {max_retries} attempts, "
+                    f"falling back to market order"
+                )
+
+                # Use emergency market close as fallback
+                await self._emergency_market_close(grvt_close_side, lighter_close_side)
                 return
 
             # Step 2: Immediately close Lighter position with market order
@@ -659,6 +749,8 @@ class GrvtLighterHedgeBot:
                         should_close, reason = await self._check_stop_conditions()
                         if should_close:
                             self.logger.log(f"Stop condition met: {reason}", "INFO")
+                            # Set emergency close flag for market order execution
+                            self.position.emergency_close = True
                             break
 
                         # Sleep and check again

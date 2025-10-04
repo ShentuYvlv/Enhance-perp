@@ -113,6 +113,10 @@ async def main():
     reverse = os.getenv('CROSS_HEDGE_REVERSE', 'false').lower() == 'true'
     cycle_wait = int(os.getenv('CROSS_HEDGE_CYCLE_WAIT', '20'))
 
+    # Get absolute USDC stop loss and take profit (new parameters)
+    max_loss_usdc = Decimal(os.getenv('CROSS_HEDGE_MAX_LOSS_USDC', '50'))
+    max_profit_usdc = Decimal(os.getenv('CROSS_HEDGE_MAX_PROFIT_USDC', '100'))
+
     # Create configuration
     config = CrossHedgeConfig(
         ticker=args.ticker.upper(),
@@ -120,6 +124,8 @@ async def main():
         hold_time=hold_time,
         take_profit=take_profit,
         stop_loss=stop_loss,
+        max_loss_usdc=max_loss_usdc,
+        max_profit_usdc=max_profit_usdc,
         reverse=reverse,
         cycle_wait=cycle_wait
     )
